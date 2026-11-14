@@ -1,0 +1,233 @@
+name: Release New Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "New version (e.g. v0.1.1)."
+        required: true
+        type: string
+      sha:
+        description: "Commit to release (default: latest main commit)"
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Tag and GitHub release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Create the tag and release.
+      actions: read # Check CI status of the release commit.
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+      sha: ${{ steps.validate.outputs.sha }}
+      prev_tag: ${{ steps.validate.outputs.prev_tag }}
+    steps:
+      - name: Check the workflow runs from main
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Releases can only be made from main (got $GITHUB_REF)."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # All history and tags, for the ancestry check and previous tag.
+          persist-credentials: false
+
+      - name: Validate version and commit
+        id: validate
+        env:
+          VERSION: ${{ inputs.version }}
+          SHA_INPUT: ${{ inputs.sha }}
+        run: |
+          # Major version bumps (v1+) are not supported yet.
+          if [[ ! "$VERSION" =~ ^v0\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Version must look like v0.MINOR.PATCH (got '$VERSION')."
+            exit 1
+          fi
+
+          if [[ -z "$SHA_INPUT" ]]; then
+            # The main commit at the time the workflow was triggered (also the checked-out one).
+            sha="$GITHUB_SHA"
+          elif [[ "$SHA_INPUT" =~ ^[0-9a-f]{7,40}$ ]] && sha=$(git rev-parse --verify --quiet "${SHA_INPUT}^{commit}"); then
+            :
+          else
+            echo "::error::'$SHA_INPUT' is not a commit in this repository."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$sha" origin/main; then
+            echo "::error::$sha is not on main."
+            exit 1
+          fi
+
+          if git rev-parse --verify --quiet "refs/tags/$VERSION" > /dev/null; then
+            echo "::error::Tag $VERSION already exists."
+            exit 1
+          fi
+
+          # The highest existing tag that sorts before the new version.
+          prev_tag=$({ git tag --list 'v[0-9]*'; echo "$VERSION"; } | sort -V \
+            | awk -v v="$VERSION" '$0 == v { exit } { p = $0 } END { print p }')
+
+          echo "Releasing $sha as $VERSION (previous: ${prev_tag:-none})."
+          {
+            echo "version=$VERSION"
+            echo "sha=$sha"
+            echo "prev_tag=$prev_tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check CI passed on the release commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.validate.outputs.sha }}
+        run: |
+          # duckdb/community-extensions builds from this exact commit, so it must be green here.
+          passed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow MainDistributionPipeline.yml \
+            --commit "$SHA" --status success --limit 1 --json databaseId --jq 'length')
+          if [[ "$passed" -eq 0 ]]; then
+            echo "::error::No successful MainDistributionPipeline run for $SHA. Wait for it (or fix it) and retry."
+            exit 1
+          fi
+
+      - name: Build release notes
+        env:
+          VERSION: ${{ steps.validate.outputs.version }}
+        run: |
+          heading="### [$VERSION]"
+          if ! grep -qF "$heading" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '$heading' section. Add it on main first."
+            exit 1
+          fi
+          # GitHub's heading anchor drops the dots: v0.1.1 -> #v011. (Colliding versions such as
+          # v0.1.11 and v0.11.1 would get a "-1" suffix on the lower heading; this is unhandled for now.)
+          anchor="${VERSION//./}"
+          echo "See this version's changes in the [CHANGELOG#$VERSION](https://github.com/$GITHUB_REPOSITORY/blob/main/CHANGELOG.md#$anchor)." \
+            > notes.md
+          cat notes.md
+
+      - name: Create tag and GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.validate.outputs.version }}
+          SHA: ${{ steps.validate.outputs.sha }}
+        run: |
+          gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" --target "$SHA" \
+            --title "$VERSION" --notes-file notes.md
+          echo "Released [$VERSION](https://github.com/$GITHUB_REPOSITORY/releases/tag/$VERSION) at \`$SHA\`." \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  # A separate job so that it can be re-run on its own ("Re-run failed jobs") if the push fails.
+  community-extensions:
+    name: Push duckdb/community-extensions bump branch
+    needs: release
+    runs-on: ubuntu-latest
+    environment: release # Holds COMMUNITY_EXTENSIONS_FORK_TOKEN; restricted to main.
+    permissions:
+      contents: read
+    env:
+      UPSTREAM: duckdb/community-extensions
+      FORK: Noorts/community-extensions
+      VERSION: ${{ needs.release.outputs.version }}
+      SHA: ${{ needs.release.outputs.sha }}
+      PREV_TAG: ${{ needs.release.outputs.prev_tag }}
+    steps:
+      # docs/ce from the release commit, so the published description matches the released code.
+      - name: Checkout release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release.outputs.sha }}
+          path: duckir
+          sparse-checkout: docs/ce
+          persist-credentials: false
+
+      - name: Prepare bump commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          git clone --quiet "https://github.com/$UPSTREAM.git" ce
+          cd ce
+          git switch --quiet -c "duckir-$VERSION"
+
+          dir=extensions/duckir
+          mkdir -p "$dir"
+          rsync -a --delete ../duckir/docs/ce/ "$dir/"
+
+          f="$dir/description.yml"
+          for anchor in VERSION_ANCHOR_DO_NOT_CHANGE_HERE REF_ANCHOR_DO_NOT_CHANGE_HERE; do
+            if [[ $(grep -c "$anchor" "$f") -ne 1 ]]; then
+              echo "::error::Expected exactly one $anchor in docs/ce/description.yml."
+              exit 1
+            fi
+          done
+          # description.yml versions have no leading "v" (e.g. 0.1.1).
+          sed -i -e "s/VERSION_ANCHOR_DO_NOT_CHANGE_HERE/${VERSION#v}/" \
+                 -e "s/REF_ANCHOR_DO_NOT_CHANGE_HERE/$SHA/" "$f"
+          if grep -rn '_ANCHOR_DO_NOT_CHANGE_HERE' "$dir"; then
+            echo "::error::Unreplaced anchors left in $dir."
+            exit 1
+          fi
+          git --no-pager diff --stat
+          git --no-pager diff -- "$f"
+
+          # Author: the maintainer who triggered the release. Committer: the Actions bot.
+          id=$(gh api "users/$TRIGGERING_ACTOR" --jq .id)
+          git add -A "$dir"
+          if git diff --cached --quiet; then
+            echo "::error::Nothing changed in $dir; is $VERSION already upstream?"
+            exit 1
+          fi
+          GIT_AUTHOR_NAME="$TRIGGERING_ACTOR" \
+          GIT_AUTHOR_EMAIL="$id+$TRIGGERING_ACTOR@users.noreply.github.com" \
+          GIT_COMMITTER_NAME="github-actions[bot]" \
+          GIT_COMMITTER_EMAIL="41898282+github-actions[bot]@users.noreply.github.com" \
+            git commit --quiet -m "Update DuckIR to $VERSION"
+
+      - name: Push branch to fork
+        working-directory: ce
+        env:
+          FORK_TOKEN: ${{ secrets.COMMUNITY_EXTENSIONS_FORK_TOKEN }}
+        run: |
+          if [[ -z "$FORK_TOKEN" ]]; then
+            echo "::error::COMMUNITY_EXTENSIONS_FORK_TOKEN is not set in the release environment."
+            exit 1
+          fi
+          # The credential helper reads the token from the environment, so it never appears in a
+          # URL, the command line, or .git/config. The single quotes are intentional.
+          # shellcheck disable=SC2016
+          git -c credential.helper= \
+              -c credential.helper='!f() { echo username=x-access-token; echo "password=$FORK_TOKEN"; }; f' \
+              push --force "https://github.com/$FORK.git" "HEAD:refs/heads/duckir-$VERSION"
+
+      - name: Write PR link to summary
+        run: |
+          title="Update DuckIR to $VERSION"
+          body="Updates DuckIR to $VERSION. CI passes on the release commit [\`${SHA:0:7}\`](https://github.com/$GITHUB_REPOSITORY/commit/$SHA).
+
+          - See this version's changes in the [CHANGELOG#$VERSION](https://github.com/$GITHUB_REPOSITORY/blob/main/CHANGELOG.md#${VERSION//./})."
+          if [[ -n "$PREV_TAG" ]]; then
+            body+="
+          - Changes since $PREV_TAG: https://github.com/$GITHUB_REPOSITORY/compare/$PREV_TAG...$VERSION"
+          fi
+          body+="
+
+          cc: @Noorts @lkuffo"
+
+          uri() { jq -rn --arg s "$1" '$s | @uri'; }
+          url="https://github.com/$UPSTREAM/compare/main...${FORK/\//:}:duckir-$VERSION?quick_pull=1&title=$(uri "$title")&body=$(uri "$body")"
+          {
+            echo "### Open the community-extensions PR"
+            echo
+            echo "Branch \`duckir-$VERSION\` is pushed to [$FORK](https://github.com/$FORK/tree/duckir-$VERSION)."
+            echo
+            echo "**[Open the PR on $UPSTREAM]($url)**"
+          } >> "$GITHUB_STEP_SUMMARY"
