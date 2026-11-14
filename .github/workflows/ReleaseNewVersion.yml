@@ -1,3 +1,4 @@
+# See DEVELOPMENT.md for more details about the release process.
 name: Release New Version
 
 on:

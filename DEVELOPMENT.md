@@ -118,3 +118,25 @@ On Linux, pass the binary instead: `make tidy-check TIDY_BINARY=clang-tidy-18`.
 ## FAQ
 
 - **I pulled the latest commits, and now the build fails.** Did they bump a submodule (e.g., DuckDB)? Then `git status` shows `modified: duckdb (new commits)`. Run `git submodule update --init --recursive` from the repository root.
+
+## Publishing
+
+### Versioning
+
+We currently follow the [pre-release extension](https://duckdb.org/docs/2.0/extensions/versioning_of_extensions#pre-release-extensions) versioning approach.
+
+We document extension changes in the [CHANGELOG.md](CHANGELOG.md).
+
+### Release process
+
+DuckIR maintainers can release new versions.
+
+1. Determine the release commit (we need the commit sha `X`; specifying this is optional, we default to the latest commit on `main`).
+2. Determine the new version to bump to v`Y` (e.g., v0.1.1).
+3. Update the [CHANGELOG.md](CHANGELOG.md) to ensure it has a section for v`Y`.
+     - You might want to make some CHANGELOG updates and create a commit on `main` (e.g., `docs: prepare CHANGELOG.md for vY`).
+4. Trigger the [ReleaseNewVersion.yml](https://github.com/cwida/DuckIR/actions/workflows/ReleaseNewVersion.yml) workflow.
+     - This will perform validity checks, create a git tag, create a GitHub release, and prepare a duckdb/community-extensions bump commit and PR.
+5. The ReleaseNewVersion workflow will generate a URL to open a PR. Click it.
+
+Maintainers can find more details about the setup in [cwida/DuckIR-Internal/issues/124](https://github.com/cwida/DuckIR-Internal/issues/124).
