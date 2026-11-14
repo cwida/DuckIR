@@ -3,9 +3,9 @@
         <img src="/docs/diagrams/header.png" alt="DuckIR: A DuckDB extension for Information Retrieval">
 </p>
 
-<h4 align="center">
+<h3 align="center">
   A DuckDB extension for Information Retrieval
-</h4>
+</h3>
 <p align="center">
   Vector Search ✅ | Full Text Search (WIP ⏱️) | Hybrid Search (WIP ⏱️)
 </p>
