@@ -36,6 +36,13 @@ public:
 	bool IsSource() const override {
 		return true;
 	}
+	//! The index's source interface emits nothing, so it is done as soon as it starts.
+	ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate) const override {
+		ProgressData result;
+		result.done = 1.0;
+		result.total = 1.0;
+		return result;
+	}
 
 public:
 	//! Sink interface, thread-local sink states

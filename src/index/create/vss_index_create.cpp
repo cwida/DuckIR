@@ -49,9 +49,10 @@ public:
 		    skmeans::BatchComputer<skmeans::DistanceFunction::l2, skmeans::Quantization::f32>::ScratchSize(
 		        all_threads) *
 		    sizeof(float);
-		// Note that for a plain table scan, op.estimated_cardinality is exact.
-		const idx_t num_row_groups =
-		    MaxValue<idx_t>(1, (op.estimated_cardinality + row_group_size - 1) / row_group_size);
+
+		// Note that for a plain table scan, the estimated cardinality is exact.
+		const auto estimated_cardinality = op.children[0].get().estimated_cardinality;
+		const idx_t num_row_groups = MaxValue<idx_t>(1, (estimated_cardinality + row_group_size - 1) / row_group_size);
 		memory_state = TemporaryMemoryManager::Get(context).Register(context);
 		memory_state->SetMinimumReservation(build_bytes + kmeans_tiles_bytes);
 		memory_state->SetRemainingSizeAndUpdateReservation(

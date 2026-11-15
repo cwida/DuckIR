@@ -116,10 +116,10 @@ PhysicalOperator &VSSIndex::CreatePlan(PlanIndexInput &input) {
 	select_list.push_back(
 	    make_uniq<BoundReferenceExpression>(LogicalType::ROW_TYPE, create_index.info->scan_types.size() - 1));
 
-	create_index.estimated_cardinality = input.table_scan.estimated_cardinality;
+	const auto table_scan_cardinality = input.table_scan.estimated_cardinality;
 
 	auto &projection =
-	    planner.Make<PhysicalProjection>(new_column_types, std::move(select_list), create_index.estimated_cardinality);
+	    planner.Make<PhysicalProjection>(new_column_types, std::move(select_list), table_scan_cardinality);
 	projection.children.push_back(input.table_scan);
 
 	// Filter operator for IS_NOT_NULL on each key column
@@ -135,11 +135,14 @@ PhysicalOperator &VSSIndex::CreatePlan(PlanIndexInput &input) {
 		filter_select_list.push_back(std::move(is_not_null_expr));
 	}
 
-	auto &null_filter = planner.Make<PhysicalFilter>(std::move(filter_types), std::move(filter_select_list),
-	                                                 create_index.estimated_cardinality);
+	auto &null_filter =
+	    planner.Make<PhysicalFilter>(std::move(filter_types), std::move(filter_select_list), table_scan_cardinality);
 	null_filter.types.emplace_back(LogicalType::ROW_TYPE);
 	null_filter.children.push_back(projection);
 
+	// CREATE INDEX emits no rows. The cardinality of its source pipeline is that pipeline's weight in the query's
+	// progress, and the plan's root takes the cardinality of the logical operator.
+	create_index.estimated_cardinality = 0;
 	auto &physical_create_index = planner.Make<PhysicalCreateVSSIndex>(
 	    create_index.types, create_index.table, create_index.info->column_ids, std::move(create_index.info),
 	    std::move(create_index.unbound_expressions), create_index.estimated_cardinality);
