@@ -9,3 +9,5 @@ test/python/__pycache__/
 .cache/
 # compilation database for clangd
 compile_commands.json
+# In-memory DuckDB temp file directory.
+.tmp
