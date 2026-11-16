@@ -19,13 +19,13 @@ Types of changes:
 
 -->
 
-### [Unreleased](https://github.com/cwida/DuckIR/compare/v0.1.1...HEAD)
+### [Unreleased](https://github.com/cwida/DuckIR/compare/v0.2.0...HEAD)
 
 -
 
-### [v0.1.1](https://github.com/cwida/DuckIR/compare/v0.1.0...v0.1.1)
+### [v0.2.0](https://github.com/cwida/DuckIR/compare/v0.1.0...v0.2.0)
 
-> 2026-11-15
+> 2026-11-17
 
 - Fixed VSS index creation progress tracking [(#98)](https://github.com/cwida/DuckIR/pull/98).
 - Improved filtered search and LATERAL JOIN performance [(#101)](https://github.com/cwida/DuckIR/pull/101).
