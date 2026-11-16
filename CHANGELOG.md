@@ -27,7 +27,8 @@ Types of changes:
 
 > 2026-11-15
 
-- Fix VSS index creation progress tracking [(#98)](https://github.com/cwida/DuckIR/pull/98).
+- Fixed VSS index creation progress tracking [(#98)](https://github.com/cwida/DuckIR/pull/98).
+- Improved filtered search and LATERAL JOIN performance [(#101)](https://github.com/cwida/DuckIR/pull/101).
 
 ### [v0.1.0](https://github.com/cwida/DuckIR/releases/tag/v0.1.0)
 

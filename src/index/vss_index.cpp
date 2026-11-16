@@ -360,7 +360,8 @@ idx_t VSSIndex::FetchRows(DataTable &table, const std::vector<VSSRowRange> &rang
 			// Without a rotation, the rows go straight to the output.
 			float *const batch_embeddings = rotate ? raw_embeddings.get() : embeddings + count * num_dimensions;
 			idx_t batch_count = 0;
-			for (idx_t i = 0; i < chunk.size() && count + batch_count < max_rows; i++) {
+			const idx_t chunk_size = chunk.size();
+			for (idx_t i = 0; i < chunk_size && count + batch_count < max_rows; i++) {
 				// The scan starts at the vector that holds the first range's start, and reads the gaps between ranges.
 				while (range_idx < last_range_idx && ranges[range_idx].end <= scanned_row_ids[i]) {
 					range_idx++;
