@@ -189,20 +189,42 @@ SinkResultType PhysicalVSSIndexJoin::Sink(ExecutionContext &context, DataChunk &
 
 	chunk.data[0].Flatten();
 	const auto row_ids = FlatVector::GetData<row_t>(chunk.data[0]);
+	const idx_t chunk_size = chunk.size();
+	VSSRowRange row_group_range = l_sink.current_row_group_range;
+	std::vector<size_t> *row_group_row_ids = nullptr;
+	size_t *row_group_row_ids_data = nullptr;
+	idx_t num_row_group_row_ids = 0;
+	if (row_group_range.start < row_group_range.end) {
+		row_group_row_ids = &l_sink.passing_row_ids_per_row_group[l_sink.current_row_group_id];
+		num_row_group_row_ids = row_group_row_ids->size();
+		row_group_row_ids->resize(num_row_group_row_ids + chunk_size);
+		row_group_row_ids_data = row_group_row_ids->data();
+	}
 	// No search starts here (the queries come later), so the rows only go to their row group's list
-	for (idx_t i = 0; i < chunk.size(); i++) {
+	for (idx_t i = 0; i < chunk_size; i++) {
 		const row_t row_id = row_ids[i];
-		if (row_id < l_sink.current_row_group_range.start || row_id >= l_sink.current_row_group_range.end) {
+		if (row_id < row_group_range.start || row_id >= row_group_range.end) {
 			const auto row_group_idx = vss_index.LookupRowGroup(row_id);
 			if (!row_group_idx.IsValid()) {
 				// Rows without an embedding are not in the index.
 				continue;
 			}
+			if (row_group_row_ids) {
+				row_group_row_ids->resize(num_row_group_row_ids);
+			}
 			l_sink.current_row_group_id = row_group_idx.GetIndex();
-			l_sink.current_row_group_range = vss_index.GetRowGroupRange(l_sink.current_row_group_id);
+			row_group_range = vss_index.GetRowGroupRange(l_sink.current_row_group_id);
+			row_group_row_ids = &l_sink.passing_row_ids_per_row_group[l_sink.current_row_group_id];
+			num_row_group_row_ids = row_group_row_ids->size();
+			row_group_row_ids->resize(num_row_group_row_ids + chunk_size - i);
+			row_group_row_ids_data = row_group_row_ids->data();
 		}
-		l_sink.passing_row_ids_per_row_group[l_sink.current_row_group_id].push_back(static_cast<size_t>(row_id));
+		row_group_row_ids_data[num_row_group_row_ids++] = static_cast<size_t>(row_id);
 	}
+	if (row_group_row_ids) {
+		row_group_row_ids->resize(num_row_group_row_ids);
+	}
+	l_sink.current_row_group_range = row_group_range;
 	return SinkResultType::NEED_MORE_INPUT;
 }
 

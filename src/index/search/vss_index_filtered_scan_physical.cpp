@@ -221,9 +221,17 @@ SinkResultType PhysicalVSSIndexFilteredScan::Sink(ExecutionContext &context, Dat
 	// thread's next outputs to them, which can come from its next morsel, so one chunk can hold the end of one run and
 	// the start of the next. The row group is looked up again whenever a row id leaves the current one, and a run's
 	// search starts when the run ends.
-	for (idx_t i = 0; i < input_chunk.size(); i++) {
+	const idx_t input_chunk_size = input_chunk.size();
+	// Locals keep the loop in registers: the rows are written into room made at the end of the row ids, which are
+	// trimmed to the rows written when the run ends and after the loop.
+	auto &passing_rowids = l_sink.current_row_group_passing_rowids;
+	idx_t num_passing_rowids = passing_rowids.size();
+	passing_rowids.resize(num_passing_rowids + input_chunk_size);
+	size_t *passing_rowids_data = passing_rowids.data();
+	VSSRowRange row_group_range = l_sink.current_row_group_range;
+	for (idx_t i = 0; i < input_chunk_size; i++) {
 		const row_t row_id = input_chunk_row_ids[i];
-		if (row_id < l_sink.current_row_group_range.start || row_id >= l_sink.current_row_group_range.end) {
+		if (row_id < row_group_range.start || row_id >= row_group_range.end) {
 			const auto row_group_idx = index.LookupRowGroup(row_id);
 			if (!row_group_idx.IsValid()) {
 				// Rows without an embedding are not in the index.
@@ -233,17 +241,21 @@ SinkResultType PhysicalVSSIndexFilteredScan::Sink(ExecutionContext &context, Dat
 			// the join replays them after the scan, one hash partition at a time, so rows of a row group whose search
 			// already started can arrive again. Those are buffered and searched together at Finalize.
 			// The run of the current row group ended: start its filtered search, or buffer its row ids.
-			if (!l_sink.current_row_group_passing_rowids.empty()) {
+			if (num_passing_rowids > 0) {
+				passing_rowids.resize(num_passing_rowids);
 				BeginSearchForRowGroupOrBufferRowIds(index, g_sink, l_sink);
-				l_sink.current_row_group_passing_rowids.clear();
+				num_passing_rowids = 0;
 			}
+			passing_rowids.resize(input_chunk_size - i);
+			passing_rowids_data = passing_rowids.data();
 			l_sink.current_row_group_id = row_group_idx.GetIndex();
-			l_sink.current_row_group_range = index.GetRowGroupRange(l_sink.current_row_group_id);
+			row_group_range = index.GetRowGroupRange(l_sink.current_row_group_id);
+			l_sink.current_row_group_range = row_group_range;
 		}
-		l_sink.current_row_group_passing_rowids.push_back(static_cast<size_t>(row_id));
+		passing_rowids_data[num_passing_rowids++] = static_cast<size_t>(row_id);
 	}
-	D_ASSERT(l_sink.current_row_group_passing_rowids.size() <=
-	         static_cast<idx_t>(l_sink.current_row_group_range.end - l_sink.current_row_group_range.start));
+	passing_rowids.resize(num_passing_rowids);
+	D_ASSERT(num_passing_rowids <= static_cast<idx_t>(row_group_range.end - row_group_range.start));
 
 	return SinkResultType::NEED_MORE_INPUT;
 }
