@@ -6,22 +6,32 @@
 #include "duckdb/storage/buffer_manager.hpp"
 #include "pdx/utils.hpp"
 
+#include <type_traits>
+#include <utility>
+
 namespace duckdb {
 namespace {
 
 // DuckDB v2.0.0 registers every database-file block with the implicit BASE_TABLE tag. Newer
 // versions let the caller preserve the block's owner tag and register fixed-size index blocks
 // as ART_INDEX. Use the tagged overload when it exists while keeping v2.0.0 source-compatible.
-template <class BLOCK_MANAGER>
-auto RegisterIndexBlock(BLOCK_MANAGER &block_manager, const block_id_t block_id, int)
-    -> decltype(block_manager.RegisterBlock(block_id, MemoryTag::ART_INDEX)) {
-	return block_manager.RegisterBlock(block_id, MemoryTag::ART_INDEX);
-}
+template <class BLOCK_MANAGER, class = void>
+struct HasTaggedRegisterBlock : std::false_type {
+};
 
 template <class BLOCK_MANAGER>
-auto RegisterIndexBlock(BLOCK_MANAGER &block_manager, const block_id_t block_id, long)
-    -> decltype(block_manager.RegisterBlock(block_id)) {
-	return block_manager.RegisterBlock(block_id);
+struct HasTaggedRegisterBlock<
+    BLOCK_MANAGER, std::void_t<decltype(std::declval<BLOCK_MANAGER &>().RegisterBlock(
+                       std::declval<block_id_t>(), MemoryTag::ART_INDEX))>> : std::true_type {
+};
+
+template <class BLOCK_MANAGER>
+auto RegisterIndexBlock(BLOCK_MANAGER &block_manager, const block_id_t block_id) {
+	if constexpr (HasTaggedRegisterBlock<BLOCK_MANAGER>::value) {
+		return block_manager.RegisterBlock(block_id, MemoryTag::ART_INDEX);
+	} else {
+		return block_manager.RegisterBlock(block_id);
+	}
 }
 
 } // namespace
@@ -437,7 +447,7 @@ data_ptr_t VSSBlockChainReader::PinSegment(const IndexPointer segment, BufferHan
 		throw SerializationException("DuckIR VSS index storage points to a buffer that does not exist");
 	}
 	const auto &block_pointer = entry->second;
-	auto block_handle = RegisterIndexBlock(block_manager, block_pointer.block_id, 0);
+	auto block_handle = RegisterIndexBlock(block_manager, block_pointer.block_id);
 	if (counters.enabled.load(std::memory_order_relaxed) &&
 	    block_handle->GetMemory().GetState() == BlockState::BLOCK_UNLOADED) {
 		counters.blocks_read++;
