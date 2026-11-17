@@ -439,7 +439,7 @@ public:
 		return memory_allocator;
 	}
 
-	float *GetRotationMatrix() const {
+	const float *GetRotationMatrix() const {
 		return vss_wrapper->GetRotationMatrix();
 	}
 
