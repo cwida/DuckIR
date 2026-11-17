@@ -84,6 +84,19 @@ private:
 	decltype(auto) DispatchWrapper(F &&f) const {
 		switch (vss_wrapper->GetQuantization()) {
 		case PDX::F32:
+			return f(*static_cast<const VSSWrapperF32 *>(vss_wrapper.get()));
+		case PDX::U8:
+			return f(*static_cast<const VSSWrapperU8 *>(vss_wrapper.get()));
+		case PDX::SAQ:
+			return f(*static_cast<const VSSWrapperSAQ *>(vss_wrapper.get()));
+		default:
+			throw InternalException("Unsupported quantization in the DuckIR VSS index");
+		}
+	}
+	template <class F>
+	decltype(auto) DispatchWrapper(F &&f) {
+		switch (vss_wrapper->GetQuantization()) {
+		case PDX::F32:
 			return f(*static_cast<VSSWrapperF32 *>(vss_wrapper.get()));
 		case PDX::U8:
 			return f(*static_cast<VSSWrapperU8 *>(vss_wrapper.get()));
