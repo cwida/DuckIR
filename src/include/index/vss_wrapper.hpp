@@ -145,7 +145,7 @@ public:
 	PDX::ClusterSketchCheck GetClusterSketchCheck() const {
 		return cluster_sketch_check;
 	}
-	float *GetRotationMatrix() const {
+	const float *GetRotationMatrix() const {
 		return rotation_matrix.get();
 	}
 	const PDX::SAQModel *GetSAQModel() const {
