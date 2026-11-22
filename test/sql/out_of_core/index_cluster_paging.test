@@ -154,7 +154,7 @@ SET VARIABLE query_vector = (SELECT vec FROM p.q WHERE qid = 200000);
 loop i 0 3
 
 statement ok
-INSERT INTO p.u SELECT id, emb::FLOAT[{DIMS}] FROM read_parquet('test/assets/sift-128-euclidean-245760.parquet') WHERE id = 4096 + ${i};
+INSERT INTO p.u SELECT id, emb::FLOAT[{DIMS}] FROM read_parquet('test/assets/sift-128-euclidean-245760.parquet') WHERE id = 4096 + {i};
 
 query I
 SELECT count(*) FROM (SELECT id FROM p.u ORDER BY array_distance(emb, getvariable('query_vector')) LIMIT 10);
