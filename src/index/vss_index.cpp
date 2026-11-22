@@ -13,6 +13,8 @@
 #include "pdx/common.hpp"
 #include "pdx/utils.hpp"
 #include "index/vss_index.hpp"
+
+#include <random>
 #include "index/vss_parallel_executor.hpp"
 
 #include "index/vss_module.hpp"
@@ -68,11 +70,14 @@ VSSIndex::VSSIndex(const Identifier &name, IndexConstraintType index_constraint_
 		n_probe = n_probe_opt->second.GetValue<int32_t>();
 	}
 
-	// TODO: Confirm the static cast is sound.
-	auto seed = static_cast<int32_t>(std::random_device {}());
+	// A persisted index always has its seed: only a new one draws (std::random_device may throw).
+	int32_t seed;
 	const auto seed_opt = options.find("seed");
 	if (seed_opt != options.end()) {
 		seed = seed_opt->second.GetValue<int32_t>();
+	} else {
+		std::random_device random_device;
+		seed = std::uniform_int_distribution<int32_t>(VSSWrapper::MIN_SEED, VSSWrapper::MAX_SEED)(random_device);
 	}
 
 	auto build_cluster_sketches = VSSWrapper::DEFAULT_CLUSTER_SKETCHES;

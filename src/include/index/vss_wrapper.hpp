@@ -3,6 +3,7 @@
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/helper.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include <algorithm>
 #include <cstddef>
@@ -36,6 +37,9 @@ public:
 	static constexpr float SAQ_PRUNING_SIGNIFICANCE = 0.01f;
 	static constexpr int32_t DEFAULT_N_PROBE = 24; // 5% of the data in a full search
 	static constexpr bool DEFAULT_CLUSTER_SKETCHES = true;
+	// Symmetric, so every valid seed literal is an INTEGER: DuckDB types -2147483648 as a BIGINT.
+	static constexpr int32_t MIN_SEED = -NumericLimits<int32_t>::Maximum();
+	static constexpr int32_t MAX_SEED = NumericLimits<int32_t>::Maximum();
 	// Clusters average about 256 rows, one u8 block
 	static constexpr uint32_t DEFAULT_MAX_CLUSTER_SIZE = 384;
 	static constexpr uint32_t MAX_CLUSTER_SIZE_UPPER_BOUND = 2048;

@@ -117,21 +117,26 @@ endloop
 # Parameter: seed
 # ============================================
 
-# int32 ranges from -2147483648 to 2147483647.
+# Seeds are INTEGERs from MIN_SEED to MAX_SEED,
 
-foreach invalid_seed 'test' -2147483649 2147483648
+foreach invalid_seed 'test' NULL 1.5 -2147483649 -2147483648 2147483648
 
 statement error
 CREATE INDEX idx ON t1 USING DUCKIR_VSS (emb) WITH (seed = {invalid_seed});
 ----
-Binder Error: DuckIR VSS index 'seed' must be between -2147483648 and 2147483647, inclusive
+Binder Error: DuckIR VSS index 'seed' must be between -2147483647 and 2147483647, inclusive
 
 endloop
 
-foreach valid_seed -2147483648 -2147483647 -1 0 1 2147483647
+foreach valid_seed -2147483647 -1 0 1 2147483647
 
 statement ok
 CREATE INDEX idx ON t1 USING DUCKIR_VSS (emb) WITH (seed = {valid_seed});
+
+query I
+SELECT seed = {valid_seed} FROM duckir_vss_index_info() WHERE index_name = 'idx';
+----
+true
 
 statement ok
 DROP INDEX IF EXISTS idx;

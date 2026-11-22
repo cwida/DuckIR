@@ -306,7 +306,7 @@ SELECT count(*) FROM (SELECT id, emb FROM t4 WHERE id < 5) q, LATERAL (SELECT t4
 
 onlyif threadid=3
 statement ok
-INSERT INTO u VALUES (${i});
+INSERT INTO u VALUES ({i});
 
 onlyif threadid=3
 statement ok
@@ -339,7 +339,7 @@ loop j 0 300
 
 onlyif threadid=1
 statement ok
-INSERT INTO u VALUES (${j});
+INSERT INTO u VALUES ({j});
 
 onlyif threadid=1
 statement ok

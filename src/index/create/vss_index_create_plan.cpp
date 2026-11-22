@@ -61,8 +61,10 @@ PhysicalOperator &VSSIndex::CreatePlan(PlanIndexInput &input) {
 				                      VSSWrapper::DEFAULT_N_PROBE);
 			}
 		} else if (StringUtil::CIEquals(k, "seed")) {
-			if (v.type() != LogicalType::INTEGER) {
-				throw BinderException("DuckIR VSS index 'seed' must be between -2147483648 and 2147483647, inclusive");
+			if (v.type() != LogicalType::INTEGER || v.GetValue<int32_t>() < VSSWrapper::MIN_SEED ||
+			    v.GetValue<int32_t>() > VSSWrapper::MAX_SEED) {
+				throw BinderException("DuckIR VSS index 'seed' must be between %d and %d, inclusive",
+				                      VSSWrapper::MIN_SEED, VSSWrapper::MAX_SEED);
 			}
 		} else if (StringUtil::CIEquals(k, "cluster_sketches")) {
 			if (v.type() != LogicalType::BOOLEAN) {
