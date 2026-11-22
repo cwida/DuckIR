@@ -41,6 +41,21 @@ CREATE TABLE q AS SELECT (id - 240000)::INTEGER AS qid, emb::FLOAT[{DIMS}] AS ve
 statement ok
 CREATE TABLE q_extra AS SELECT qid, vec FROM q UNION ALL SELECT qid + 100, vec FROM q WHERE qid < 3 UNION ALL SELECT 99, NULL;
 
+# Query 0's vector (its third value is 0) twice, the second time with -0.0 as its third value. A cast from a string:
+# the literal -0.0 is a DECIMAL, and (-0.0)::FLOAT a positive zero.
+statement ok
+CREATE TABLE q_zero AS SELECT 0 AS qid, vec FROM q WHERE qid = 0 UNION ALL SELECT 1, list_transform(vec::FLOAT[], lambda x, i: CASE WHEN i = 3 THEN '-0.0'::FLOAT ELSE x END)::FLOAT[{DIMS}] FROM q WHERE qid = 0;
+
+query II
+SELECT qid, sign(1 / vec[3]) FROM q_zero ORDER BY qid;
+----
+0	1
+1	-1
+
+# The unindexed table: DuckDB's own plan for the LATERAL joins below.
+statement ok
+CREATE TABLE t_bf AS FROM t;
+
 statement ok
 CREATE TABLE t_cosine AS FROM t;
 
@@ -275,6 +290,58 @@ query I
 SELECT count(*) FROM join_result;
 ----
 30
+
+query I
+SELECT count(*) FROM ((FROM single_result EXCEPT ALL FROM join_result) UNION ALL (FROM join_result EXCEPT ALL FROM single_result));
+----
+0
+
+# The query vector in the result, between two of t's columns: the projection above the top K reads it from the query
+# rows (DuckDB v2.0.1 (https://github.com/duckdb/duckdb/pull/28609) copies a FLOAT group into the payload of each row),
+# and t's columns by name from the rest.
+query II
+EXPLAIN SELECT q.qid, s.id FROM q, LATERAL (SELECT t.id FROM t ORDER BY array_distance(t.emb, q.vec) LIMIT 10) s;
+----
+physical_plan	<!REGEX>:.*struct_pack\([^)]*,.*
+
+foreach k 10 1
+
+statement ok
+CREATE OR REPLACE TABLE join_result AS SELECT q.qid, s.id, s.cat, s.v = q.vec AS same_vector FROM q, LATERAL (SELECT t.cat, q.vec AS v, t.id FROM t ORDER BY array_distance(t.emb, q.vec) LIMIT {k}) s;
+
+statement ok
+CREATE OR REPLACE TABLE single_result AS SELECT q.qid, s.id, t.cat, true AS same_vector FROM q, LATERAL (SELECT t.id FROM t ORDER BY array_distance(t.emb, q.vec) LIMIT {k}) s JOIN t USING (id);
+
+query I
+SELECT count(*) = 10 * {k} FROM join_result;
+----
+true
+
+query I
+SELECT count(*) FROM ((FROM single_result EXCEPT ALL FROM join_result) UNION ALL (FROM join_result EXCEPT ALL FROM single_result));
+----
+0
+
+endloop
+
+# Query vectors that differ only in the sign of a zero: DuckDB merges them in the DISTINCT of the query rows, so the
+# copy that https://github.com/duckdb/duckdb/pull/28609 puts in the payload holds one sign for both. Reading the query
+# vector from the group returns the same signs as DuckDB's plan without the index join.
+query II
+EXPLAIN SELECT q.qid, s.id FROM q_zero q, LATERAL (SELECT t.id, q.vec AS v FROM t ORDER BY array_distance(t.emb, q.vec) LIMIT 10) s;
+----
+physical_plan	<REGEX>:.*DUCKIR_VSS_INDEX_JOIN.*
+
+statement ok
+CREATE OR REPLACE TABLE join_result AS SELECT q.qid, sign(1 / s.v[3]) AS zero_sign FROM q_zero q, LATERAL (SELECT t.id, q.vec AS v FROM t ORDER BY array_distance(t.emb, q.vec) LIMIT 10) s;
+
+statement ok
+CREATE OR REPLACE TABLE single_result AS SELECT q.qid, sign(1 / s.v[3]) AS zero_sign FROM q_zero q, LATERAL (SELECT t.id, q.vec AS v FROM t_bf t ORDER BY array_distance(t.emb, q.vec) LIMIT 10) s;
+
+query I
+SELECT count(*) FROM join_result;
+----
+20
 
 query I
 SELECT count(*) FROM ((FROM single_result EXCEPT ALL FROM join_result) UNION ALL (FROM join_result EXCEPT ALL FROM single_result));

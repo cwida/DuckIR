@@ -1,4 +1,6 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/function/builtin_function_lookup.hpp"
+#include "duckdb/function/function_binder.hpp"
 #include "duckdb/function/scalar/compressed_materialization_functions.hpp"
 #include "duckdb/function/scalar/compressed_materialization_utils.hpp"
 #include "duckdb/optimizer/column_lifetime_analyzer.hpp"
@@ -9,6 +11,7 @@
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_unnest_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
@@ -20,6 +23,7 @@
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
+#include "duckdb/planner/operator/logical_unnest.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -1547,6 +1551,212 @@ public:
 		}
 	}
 
+	// The top K per query above an index join (scenario 4), as DuckDB's TopN window elimination leaves it: `projection`
+	// over an UNNEST of each query's K rows (none when K is 1) over the AGGREGATE `arg_min(struct_pack(...), distance[,
+	// K])` grouped by the query rows. Returns the aggregate, and sets `unnest`.
+	static optional_ptr<LogicalAggregate> TryMatchIndexJoinTopK(LogicalProjection &projection,
+	                                                            optional_ptr<LogicalUnnest> &unnest) {
+		if (projection.children.size() != 1) {
+			return nullptr;
+		}
+		reference<LogicalOperator> child = *projection.children[0];
+		if (child.get().type == LogicalOperatorType::LOGICAL_UNNEST) {
+			unnest = child.get().Cast<LogicalUnnest>();
+			if (unnest->children.size() != 1 || unnest->expressions.size() != 1 ||
+			    unnest->expressions[0]->GetExpressionClass() != ExpressionClass::BOUND_UNNEST) {
+				return nullptr;
+			}
+			child = *unnest->children[0];
+		}
+		if (child.get().type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY ||
+		    child.get().children.size() != 1) {
+			return nullptr;
+		}
+		auto &aggregate = child.get().Cast<LogicalAggregate>();
+		if (aggregate.expressions.size() != 1 || aggregate.grouping_sets.size() > 1 ||
+		    !aggregate.grouping_functions.empty() ||
+		    aggregate.expressions[0]->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+			return nullptr;
+		}
+		auto &function = aggregate.expressions[0]->Cast<BoundAggregateExpression>();
+		if ((function.Function().GetName() != "arg_min" && function.Function().GetName() != "arg_min_nulls_last") ||
+		    function.GetChildren().empty() ||
+		    function.GetChildren()[0]->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION ||
+		    function.GetChildren()[0]->Cast<BoundFunctionExpression>().Function().GetName() != "struct_pack") {
+			return nullptr;
+		}
+		// The UNNEST unnests the aggregate's list of K rows.
+		if (unnest) {
+			auto &unnested = *unnest->expressions[0]->Cast<BoundUnnestExpression>().Child();
+			if (unnested.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF ||
+			    unnested.Cast<BoundColumnRefExpression>().Binding() != aggregate.GetColumnBindings().back()) {
+				return nullptr;
+			}
+		}
+		reference<LogicalOperator> below = *aggregate.children[0];
+		while (below.get().type == LogicalOperatorType::LOGICAL_PROJECTION && below.get().children.size() == 1) {
+			below = *below.get().children[0];
+		}
+		if (below.get().type != LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR ||
+		    below.get().GetName() != "DUCKIR_VSS_INDEX_JOIN") {
+			return nullptr;
+		}
+		return aggregate;
+	}
+
+	// The struct_pack TryMatchIndexJoinTopK matched as the aggregate's payload.
+	static BoundFunctionExpression &GetPayload(LogicalAggregate &aggregate) {
+		auto &function = aggregate.expressions[0]->Cast<BoundAggregateExpression>();
+		return function.GetChildrenMutable()[0]->Cast<BoundFunctionExpression>();
+	}
+
+	// The fields of the aggregate's payload that copy one of its groups, by name, with the group's position.
+	static unordered_map<string, idx_t> CollectGroupCopies(LogicalAggregate &aggregate) {
+		unordered_map<string, idx_t> copies;
+		auto &payload = GetPayload(aggregate);
+		for (idx_t i = 0; i < payload.GetChildren().size(); i++) {
+			auto &field = *payload.GetChildren()[i];
+			if (field.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+				continue;
+			}
+			for (idx_t group = 0; group < aggregate.groups.size(); group++) {
+				auto &group_expression = *aggregate.groups[group];
+				if (group_expression.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF &&
+				    group_expression.Cast<BoundColumnRefExpression>().Binding() ==
+				        field.Cast<BoundColumnRefExpression>().Binding()) {
+					copies[StructType::GetChildName(payload.GetReturnType(), i).GetIdentifierName()] = group;
+					break;
+				}
+			}
+		}
+		return copies;
+	}
+
+	// Whether `expression` is `struct_extract(binding, '<field>')`.
+	static bool IsStructFieldRead(const Expression &expression, const ColumnBinding &binding) {
+		if (expression.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+			return false;
+		}
+		auto &function = expression.Cast<BoundFunctionExpression>();
+		if (function.Function().GetName() != "struct_extract" || function.GetChildren().size() != 2) {
+			return false;
+		}
+		auto &source = *function.GetChildren()[0];
+		auto &field = *function.GetChildren()[1];
+		return source.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF &&
+		       source.Cast<BoundColumnRefExpression>().Binding() == binding &&
+		       field.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
+		       field.Cast<BoundConstantExpression>().GetValue().type().id() == LogicalTypeId::VARCHAR &&
+		       !field.Cast<BoundConstantExpression>().GetValue().IsNull();
+	}
+
+	// Whether `expression` reads `binding` only through IsStructFieldRead.
+	static bool ReadsOnlyStructFields(const Expression &expression, const ColumnBinding &binding) {
+		if (IsStructFieldRead(expression, binding)) {
+			return true;
+		}
+		if (expression.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+			return expression.Cast<BoundColumnRefExpression>().Binding() != binding;
+		}
+		bool reads_only_fields = true;
+		ExpressionIterator::EnumerateChildren(expression, [&](const Expression &child) {
+			reads_only_fields = reads_only_fields && ReadsOnlyStructFields(child, binding);
+		});
+		return reads_only_fields;
+	}
+
+	// Rebinds the aggregate without the payload fields in `copies`, and the UNNEST to its new type. Returns the type of
+	// the struct the projection above reads.
+	static LogicalType RebindPayload(ClientContext &context, LogicalAggregate &aggregate,
+	                                 optional_ptr<LogicalUnnest> unnest, const unordered_map<string, idx_t> &copies) {
+		auto &function = aggregate.expressions[0]->Cast<BoundAggregateExpression>();
+		auto &payload = GetPayload(aggregate);
+		vector<unique_ptr<Expression>> fields;
+		for (idx_t i = 0; i < payload.GetChildren().size(); i++) {
+			if (copies.find(StructType::GetChildName(payload.GetReturnType(), i).GetIdentifierName()) == copies.end()) {
+				fields.push_back(std::move(payload.GetChildrenMutable()[i]));
+			}
+		}
+		auto arguments = std::move(function.GetChildrenMutable());
+		arguments[0] = BindBuiltinScalarFunction(context, Identifier("struct_pack"), std::move(fields));
+		vector<LogicalType> argument_types;
+		for (auto &argument : arguments) {
+			argument_types.push_back(argument->GetReturnType());
+		}
+		const auto name = function.Function().GetName();
+		aggregate.expressions[0] = FunctionBinder(context).BindAggregateFunction(
+		    GetBuiltinAggregateFunction(context, name, argument_types), std::move(arguments));
+		aggregate.ResolveOperatorTypes();
+		auto aggregate_type = aggregate.expressions[0]->GetReturnType();
+		if (!unnest) {
+			return aggregate_type;
+		}
+		auto &unnest_expression = unnest->expressions[0]->Cast<BoundUnnestExpression>();
+		unnest_expression.ChildMutable()->SetReturnType(aggregate_type);
+		unnest_expression.SetReturnType(ListType::GetChildType(aggregate_type));
+		unnest->ResolveOperatorTypes();
+		return unnest_expression.GetReturnType();
+	}
+
+	// Replaces each read of a field in `copies` with its group, and rebinds the other field reads to `struct_type`.
+	static void RewriteStructFieldReads(ClientContext &context, unique_ptr<Expression> &expression,
+	                                    const ColumnBinding &binding, const LogicalType &struct_type,
+	                                    LogicalAggregate &aggregate, const unordered_map<string, idx_t> &copies) {
+		if (!IsStructFieldRead(*expression, binding)) {
+			ExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<Expression> &child) {
+				RewriteStructFieldReads(context, child, binding, struct_type, aggregate, copies);
+			});
+			return;
+		}
+		auto &function = expression->Cast<BoundFunctionExpression>();
+		const auto alias = expression->GetAlias();
+		const auto field = function.GetChildren()[1]->Cast<BoundConstantExpression>().GetValue().GetValue<string>();
+		const auto copy = copies.find(field);
+		if (copy != copies.end()) {
+			expression = make_uniq<BoundColumnRefExpression>(aggregate.types[copy->second],
+			                                                 aggregate.GetColumnBindings()[copy->second]);
+		} else {
+			vector<unique_ptr<Expression>> arguments;
+			arguments.push_back(make_uniq<BoundColumnRefExpression>(struct_type, binding));
+			arguments.push_back(std::move(function.GetChildrenMutable()[1]));
+			expression = BindBuiltinScalarFunction(context, Identifier("struct_extract"), std::move(arguments));
+		}
+		expression->SetAlias(alias);
+	}
+
+	// Since DuckDB v2.0.1 (duckdb#28609), the top K per query carries its FLOAT or DOUBLE groups, the query vector, in
+	// its payload: a copy per result row. Above an index join, the projection reads them from the groups again.
+	static void TryUnpackQueryRows(ClientContext &context, LogicalProjection &projection) {
+		optional_ptr<LogicalUnnest> unnest;
+		auto aggregate = TryMatchIndexJoinTopK(projection, unnest);
+		if (!aggregate) {
+			return;
+		}
+		const auto copies = CollectGroupCopies(*aggregate);
+		if (copies.empty() || copies.size() == StructType::GetChildCount(GetPayload(*aggregate).GetReturnType())) {
+			return;
+		}
+		const auto binding = unnest ? unnest->GetColumnBindings().back() : aggregate->GetColumnBindings().back();
+		for (auto &expression : projection.expressions) {
+			if (!ReadsOnlyStructFields(*expression, binding)) {
+				return;
+			}
+		}
+		const auto struct_type = RebindPayload(context, *aggregate, unnest, copies);
+		for (auto &expression : projection.expressions) {
+			RewriteStructFieldReads(context, expression, binding, struct_type, *aggregate, copies);
+		}
+	}
+
+	static void UnpackQueryRowsFromPayload(ClientContext &context, LogicalOperator &op) {
+		if (op.type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			TryUnpackQueryRows(context, op.Cast<LogicalProjection>());
+		}
+		for (auto &child : op.children) {
+			UnpackQueryRowsFromPayload(context, *child);
+		}
+	}
+
 	static void PreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 		TryDisableLateMaterialization(input.context, *plan);
 		for (auto &child : plan->children) {
@@ -1558,6 +1768,7 @@ public:
 		auto did_use_vss_scan = OptimizeChildren(input, plan);
 		if (did_use_vss_scan) {
 			MergeProjections(plan);
+			UnpackQueryRowsFromPayload(input.context, *plan);
 		}
 	}
 };
