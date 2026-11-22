@@ -19,9 +19,13 @@ Types of changes:
 
 -->
 
-### [Unreleased](https://github.com/cwida/DuckIR/compare/v0.2.0...HEAD)
+### [Unreleased](https://github.com/cwida/DuckIR/compare/v0.3.0...HEAD)
 
-- Fixed performance regression introduced by DuckDB v2.0.1's `FLOAT[]` handling [(#104)](https://github.com/cwida/DuckIR/pull/104/changes/1e6f895).
+### [v0.3.0](https://github.com/cwida/DuckIR/compare/v0.2.0...v0.3.0)
+
+> 2026-11-22
+
+- Fixed performance regression introduced by DuckDB v2.0.1's `FLOAT[]` handling [(#104)](https://github.com/cwida/DuckIR/pull/104).
 - Changed index seed range to `[-2147483647, 2147483647]` [(#104)](https://github.com/cwida/DuckIR/pull/104).
 
 ### [v0.2.0](https://github.com/cwida/DuckIR/compare/v0.1.0...v0.2.0)
