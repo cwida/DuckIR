@@ -25,6 +25,7 @@ Types of changes:
 
 > 2026-11-22
 
+- Added support for DuckDB v2.0.1.
 - Fixed performance regression introduced by DuckDB v2.0.1's `FLOAT[]` handling [(#104)](https://github.com/cwida/DuckIR/pull/104).
 - Changed index seed range to `[-2147483647, 2147483647]` [(#104)](https://github.com/cwida/DuckIR/pull/104).
 
@@ -39,4 +40,5 @@ Types of changes:
 
 > 2026-11-11
 
+- Added support for DuckDB v2.0.0.
 - Added Alpha version code.
