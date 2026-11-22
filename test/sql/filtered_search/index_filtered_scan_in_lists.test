@@ -135,7 +135,8 @@ SELECT id FROM t_bf WHERE id IN ({IDS}) AND cat = 0 ORDER BY array_distance(emb,
 ----
 
 # ============================================
-# Inside an OR, negated, over an expression, two lists in one predicate.
+# Inside an OR, negated, over an expression, two lists in one predicate. DuckDB (v2.0.1) makes a MARK join of an IN
+# list only in an OR's first arm: in a later arm, the list stays an expression of the FILTER below the search.
 # ============================================
 
 query I nosort or_with_in
@@ -147,9 +148,22 @@ SELECT id FROM t_bf WHERE cat = 3 OR id IN ({IDS}) ORDER BY array_distance(emb, 
 ----
 
 query II
-EXPLAIN SELECT id FROM t WHERE cat = 3 OR id NOT IN ({IDS}) ORDER BY array_distance(emb, {QUERY_EMB}::FLOAT[{DIMS}]) LIMIT 10;
+EXPLAIN SELECT id FROM t WHERE id NOT IN ({IDS}) OR cat = 3 ORDER BY array_distance(emb, {QUERY_EMB}::FLOAT[{DIMS}]) LIMIT 10;
 ----
 physical_plan	<REGEX>:.*DUCKIR_VSS_INDEX_FILT_SCAN.*FILTER.*HASH_JOIN.*SEQ_SCAN.*
+
+query I nosort or_with_not_in
+SELECT id FROM t WHERE id NOT IN ({IDS}) OR cat = 3 ORDER BY array_distance(emb, {QUERY_EMB}::FLOAT[{DIMS}]) LIMIT 10;
+----
+
+query I nosort or_with_not_in
+SELECT id FROM t_bf WHERE id NOT IN ({IDS}) OR cat = 3 ORDER BY array_distance(emb, {QUERY_EMB}::FLOAT[{DIMS}]) LIMIT 10;
+----
+
+query II
+EXPLAIN SELECT id FROM t WHERE cat = 3 OR id NOT IN ({IDS}) ORDER BY array_distance(emb, {QUERY_EMB}::FLOAT[{DIMS}]) LIMIT 10;
+----
+physical_plan	<REGEX>:.*DUCKIR_VSS_INDEX_FILT_SCAN.*FILTER.*SEQ_SCAN.*
 
 query I nosort or_with_not_in
 SELECT id FROM t WHERE cat = 3 OR id NOT IN ({IDS}) ORDER BY array_distance(emb, {QUERY_EMB}::FLOAT[{DIMS}]) LIMIT 10;
@@ -167,17 +181,32 @@ query I nosort expression_in
 SELECT id FROM t_bf WHERE id % 1000 IN (1, 7, 13, 99, 500, 998) ORDER BY array_distance(emb, {QUERY_EMB}::FLOAT[{DIMS}]) LIMIT 10;
 ----
 
+# Two lists in one OR: the first is a MARK join, the second an expression of the FILTER.
 query II
 EXPLAIN SELECT id FROM t WHERE id IN ({IDS}) OR name IN ({NAMES}) ORDER BY array_distance(emb, {QUERY_EMB}::FLOAT[{DIMS}]) LIMIT 10;
+----
+physical_plan	<REGEX>:.*DUCKIR_VSS_INDEX_FILT_SCAN.*FILTER.*HASH_JOIN.*SEQ_SCAN.*
+
+query I nosort two_lists_in_one_or
+SELECT id FROM t WHERE id IN ({IDS}) OR name IN ({NAMES}) ORDER BY array_distance(emb, {QUERY_EMB}::FLOAT[{DIMS}]) LIMIT 10;
+----
+
+query I nosort two_lists_in_one_or
+SELECT id FROM t_bf WHERE id IN ({IDS}) OR name IN ({NAMES}) ORDER BY array_distance(emb, {QUERY_EMB}::FLOAT[{DIMS}]) LIMIT 10;
+----
+
+# Each list first in an OR of its own, under an AND (which DuckDB splits): two MARK joins.
+query II
+EXPLAIN SELECT id FROM t WHERE (id IN ({IDS}) OR cat = 3) AND (name IN ({NAMES}) OR cat = 4) ORDER BY array_distance(emb, {QUERY_EMB}::FLOAT[{DIMS}]) LIMIT 10;
 ----
 physical_plan	<REGEX>:.*DUCKIR_VSS_INDEX_FILT_SCAN.*FILTER.*HASH_JOIN.*HASH_JOIN.*SEQ_SCAN.*
 
 query I nosort two_lists
-SELECT id FROM t WHERE id IN ({IDS}) OR name IN ({NAMES}) ORDER BY array_distance(emb, {QUERY_EMB}::FLOAT[{DIMS}]) LIMIT 10;
+SELECT id FROM t WHERE (id IN ({IDS}) OR cat = 3) AND (name IN ({NAMES}) OR cat = 4) ORDER BY array_distance(emb, {QUERY_EMB}::FLOAT[{DIMS}]) LIMIT 10;
 ----
 
 query I nosort two_lists
-SELECT id FROM t_bf WHERE id IN ({IDS}) OR name IN ({NAMES}) ORDER BY array_distance(emb, {QUERY_EMB}::FLOAT[{DIMS}]) LIMIT 10;
+SELECT id FROM t_bf WHERE (id IN ({IDS}) OR cat = 3) AND (name IN ({NAMES}) OR cat = 4) ORDER BY array_distance(emb, {QUERY_EMB}::FLOAT[{DIMS}]) LIMIT 10;
 ----
 
 # ============================================
