@@ -6,6 +6,9 @@ require parquet
 
 require duckir
 
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
 # Row groups of 8192 rows (4 in the table).
 statement ok
 ATTACH '{TEST_DIR}/index_join_transactions.db' AS index_join_transactions (ROW_GROUP_SIZE 8192);
@@ -69,6 +72,8 @@ INSERT INTO single_result SELECT {i}, id FROM t ORDER BY array_distance(emb, get
 
 endloop
 
+# TODO: We'll probably want to ensure this returns 100 in the future. K rows pass the filter, so we should return K
+# items. This is the downside of removing the uncommitted transaction deletion after performing the top-K search.
 query II
 SELECT count(*), count(*) FILTER (WHERE id = getvariable('deleted_id')) FROM join_result;
 ----
@@ -78,6 +83,45 @@ query I
 SELECT count(*) FROM ((FROM single_result EXCEPT ALL FROM join_result) UNION ALL (FROM join_result EXCEPT ALL FROM single_result));
 ----
 0
+
+# A filter every row passes that DuckDB cannot fold from statistics (v2.0.1 folds id % 3 <> 5 to true).
+statement ok
+CREATE OR REPLACE TABLE join_result AS SELECT q.qid, s.id FROM q, LATERAL (SELECT t.id FROM t WHERE t.id::VARCHAR <> 'x' ORDER BY array_distance(t.emb, q.vec) LIMIT 10) s;
+
+statement ok
+CREATE OR REPLACE TABLE single_result AS FROM join_result LIMIT 0;
+
+loop i 0 10
+
+statement ok
+SET VARIABLE query_vector = (SELECT vec FROM q WHERE qid = {i});
+
+statement ok
+INSERT INTO single_result SELECT {i}, id FROM t WHERE id::VARCHAR <> 'x' ORDER BY array_distance(emb, getvariable('query_vector')) LIMIT 10;
+
+endloop
+
+query II
+SELECT count(*), count(*) FILTER (WHERE id = getvariable('deleted_id')) FROM join_result;
+----
+100	0
+
+query I
+SELECT count(*) FROM ((FROM single_result EXCEPT ALL FROM join_result) UNION ALL (FROM join_result EXCEPT ALL FROM single_result));
+----
+0
+
+# A filter DuckDB folds to true from statistics (v2.0.1): no filter is left (neither a FILTER nor one pushed into a
+# scan), the index join searches unfiltered, and query 0 has 9 rows, as the single-query searches.
+query II
+EXPLAIN SELECT q.qid, s.id FROM q, LATERAL (SELECT t.id FROM t WHERE t.id % 3 <> 5 ORDER BY array_distance(t.emb, q.vec) LIMIT 10) s;
+----
+physical_plan	<!REGEX>:.*(FILTER|Filters:).*
+
+query II
+EXPLAIN SELECT q.qid, s.id FROM q, LATERAL (SELECT t.id FROM t WHERE t.id % 3 <> 5 ORDER BY array_distance(t.emb, q.vec) LIMIT 10) s;
+----
+physical_plan	<REGEX>:.*DUCKIR_VSS_INDEX_JOIN.*
 
 statement ok
 CREATE OR REPLACE TABLE join_result AS SELECT q.qid, s.id FROM q, LATERAL (SELECT t.id FROM t WHERE t.id % 3 <> 5 ORDER BY array_distance(t.emb, q.vec) LIMIT 10) s;
@@ -98,7 +142,7 @@ endloop
 query II
 SELECT count(*), count(*) FILTER (WHERE id = getvariable('deleted_id')) FROM join_result;
 ----
-100	0
+99	0
 
 query I
 SELECT count(*) FROM ((FROM single_result EXCEPT ALL FROM join_result) UNION ALL (FROM join_result EXCEPT ALL FROM single_result));

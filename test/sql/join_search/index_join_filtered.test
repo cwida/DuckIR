@@ -389,13 +389,12 @@ SELECT count(*) FROM q, LATERAL (SELECT t.id FROM t WHERE t.id < 7 ORDER BY arra
 70
 
 # ============================================
-# No row passes: the inner LATERAL is empty, and a LEFT LATERAL pads every query row with NULLs.
-# ============================================
-
+# A filter (t.id % 1000 = 1001) DuckDB folds to false from statistics (v2.0.1): an empty result replaces the subquery,
+# without the index join, and the rows are the same.
 query II
 EXPLAIN SELECT q.qid, s.id FROM q, LATERAL (SELECT t.id FROM t WHERE t.id % 1000 = 1001 ORDER BY array_distance(t.emb, q.vec) LIMIT 10) s;
 ----
-physical_plan	<REGEX>:.*DUCKIR_VSS_INDEX_JOIN.*
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
 
 query I
 SELECT count(*) FROM q, LATERAL (SELECT t.id FROM t WHERE t.id % 1000 = 1001 ORDER BY array_distance(t.emb, q.vec) LIMIT 10) s;
@@ -404,6 +403,25 @@ SELECT count(*) FROM q, LATERAL (SELECT t.id FROM t WHERE t.id % 1000 = 1001 ORD
 
 query II
 SELECT count(*), count(s.id) FROM q LEFT JOIN LATERAL (SELECT t.id FROM t WHERE t.id % 1000 = 1001 ORDER BY array_distance(t.emb, q.vec) LIMIT 10) s ON true;
+----
+10	0
+
+# No row passes: the inner LATERAL is empty, and a LEFT LATERAL pads every query row with NULLs. DuckDB cannot fold
+# the filter (WHERE t.id::VARCHAR = 'x') from statistics.
+# ============================================
+
+query II
+EXPLAIN SELECT q.qid, s.id FROM q, LATERAL (SELECT t.id FROM t WHERE t.id::VARCHAR = 'x' ORDER BY array_distance(t.emb, q.vec) LIMIT 10) s;
+----
+physical_plan	<REGEX>:.*DUCKIR_VSS_INDEX_JOIN.*
+
+query I
+SELECT count(*) FROM q, LATERAL (SELECT t.id FROM t WHERE t.id::VARCHAR = 'x' ORDER BY array_distance(t.emb, q.vec) LIMIT 10) s;
+----
+0
+
+query II
+SELECT count(*), count(s.id) FROM q LEFT JOIN LATERAL (SELECT t.id FROM t WHERE t.id::VARCHAR = 'x' ORDER BY array_distance(t.emb, q.vec) LIMIT 10) s ON true;
 ----
 10	0
 
