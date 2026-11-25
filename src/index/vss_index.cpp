@@ -439,15 +439,15 @@ static idx_t SelectIndexableRows(VSSIndexSinkState &state, Vector &embedding_col
 		state.indexable_sel.set_index(indexable_count++, i);
 	}
 	if (first_non_finite.IsValid()) {
-		switch (state.non_finite_action) {
-		case NonFiniteEmbeddingAction::SKIP:
+		switch (state.input.unindexable_row_action) {
+		case UnindexableRowAction::SKIP:
 			break;
-		case NonFiniteEmbeddingAction::THROW:
+		case UnindexableRowAction::THROW:
 			throw InvalidInputException("DuckIR VSS: the embedding of row %lld has NaN, infinite or too large values, "
 			                            "which cannot be indexed",
 			                            scanned_row_ids[first_non_finite.GetIndex()]);
 		default:
-			throw NotImplementedException("DuckIR VSS: unknown NonFiniteEmbeddingAction");
+			throw NotImplementedException("DuckIR VSS: unknown UnindexableRowAction");
 		}
 	}
 	return indexable_count;
@@ -460,6 +460,9 @@ static float *GatherEmbeddings(VSSIndexSinkState &state, float *const scanned_em
                                const idx_t count, const idx_t num_dimensions, float *const output_embeddings) {
 	if (!HAS_SEL && state.rotate) {
 		return scanned_embeddings;
+	}
+	if (state.rotate && !state.raw_embeddings) {
+		state.raw_embeddings = make_uniq_array_uninitialized<float>(STANDARD_VECTOR_SIZE * num_dimensions);
 	}
 	float *const target = state.rotate ? state.raw_embeddings.get() : output_embeddings;
 	for (idx_t i = 0; i < count; i++) {
@@ -490,10 +493,11 @@ SinkResultType VSSIndex::SinkInternal(VSSIndexSinkState &state, DataChunk &chunk
 	D_ASSERT(row_ids_v.GetVectorType() == VectorType::FLAT_VECTOR);
 	const auto scanned_row_ids = FlatVector::GetData<row_t>(row_ids_v);
 	if (state.row_ids) {
-		GatherRowIds<HAS_SEL>(scanned_row_ids, state.indexable_sel, indexable_count, state.row_ids + state.count);
+		GatherRowIds<HAS_SEL>(scanned_row_ids, state.indexable_sel, indexable_count, state.row_ids.get() + state.count);
 	}
 	if (state.rotate) {
-		vss_wrapper->PreprocessEmbeddings(indexable_embeddings, output_embeddings, indexable_count, state.executor);
+		vss_wrapper->PreprocessEmbeddings(indexable_embeddings, output_embeddings, indexable_count,
+		                                  state.executor.get());
 	} else {
 		vss_wrapper->NormalizeEmbeddings(indexable_embeddings, indexable_count);
 	}
@@ -523,11 +527,10 @@ SinkResultType VSSIndex::Sink(IndexSinkState &sink_state, DataChunk &chunk, cons
 	return SinkInternal<false>(state, chunk, indexable_count);
 }
 
-VSSIndexSinkState::VSSIndexSinkState(const idx_t num_dimensions, float *const embeddings, row_t *const row_ids,
-                                     const bool rotate, PDX::ParallelExecutor *const executor, const idx_t max_rows)
-    : embeddings(embeddings), row_ids(row_ids), rotate(rotate), executor(executor), max_rows(max_rows),
-      raw_embeddings(make_uniq_array_uninitialized<float>(STANDARD_VECTOR_SIZE * num_dimensions)),
-      indexable_sel(STANDARD_VECTOR_SIZE) {
+VSSIndexSinkState::VSSIndexSinkState(ClientContext &context, const IndexSinkInput &input, float *const embeddings,
+                                     const bool rotate, const idx_t max_rows)
+    : IndexSinkState(input), embeddings(embeddings), rotate(rotate),
+      executor(make_uniq<DuckDBParallelExecutor>(context, input.num_threads)), max_rows(max_rows) {
 }
 
 // todo@gropaul: Move to RGPartitionedIndex
@@ -593,15 +596,12 @@ void VSSIndex::SyncWithTable(ClientContext &context, DataTable &table) {
 	// fail until a restart. It is rethrown as an IO error instead, so that only the queries on this index fail.
 	if (bind_error.HasError()) {
 		if (bind_error.Type() == ExceptionType::INTERNAL || bind_error.Type() == ExceptionType::FATAL) {
-			throw IOException("DuckIR VSS index %s could not be loaded: %s", name, bind_error.RawMessage());
+			throw IOException("%s index %s could not be loaded: %s", GetIndexType(), name, bind_error.RawMessage());
 		}
 		bind_error.Throw();
 	}
 
-	DuckDBParallelExecutor executor(context,
-	                                static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
-
-	auto row_ids = make_uniq_array<row_t>(GetLargestRowGroupCount(table));
+	const auto num_threads = static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 
 	// Row groups a checkpoint merged or dropped: their mirrors go, and the ones still in the table are rebuilt.
 	std::vector<idx_t> rows_returned;
@@ -613,17 +613,13 @@ void VSSIndex::SyncWithTable(ClientContext &context, DataTable &table) {
 		}
 		const row_t bounds_end = bounds.row_start + static_cast<row_t>(bounds.count);
 		try {
-			auto sink_state = InitializeIndexSinkState(context, bounds.count, row_ids.get());
+			const IndexSinkInput sink_input(bounds, bounds.count, num_threads);
+			auto sink_state = InitializeIndexSinkState(context, sink_input);
 			// As of every commit: a DELETE in flight already removed some of these rows from the index. The rows of an
 			// INSERT in flight it brings are in the inbox, whose ids DeleteStaleRowIds evicts later in this sync.
 			ScanAndSinkRows(table, {{bounds.row_start, bounds_end}}, *sink_state, rows_returned,
 			                /*all_committed=*/true);
-			const auto embeddings = sink_state->Cast<VSSIndexSinkState>().embeddings;
-			const idx_t count = sink_state->count;
-			if (count > 0) {
-				SetUpIndexForRowGroup(row_ids.get(), embeddings, count, bounds.row_start, bounds.count,
-				                      IsClosedRowGroup(table, bounds), &executor);
-			}
+			BuildRowGroupIndex(*sink_state, table);
 		} catch (...) {
 			// A failed rebuild leaves no mirror, and its rows staged: the next sync builds them.
 			RemoveRowGroupsOverlapping(bounds.row_start, bounds_end);
@@ -688,10 +684,10 @@ void VSSIndex::SyncWithTable(ClientContext &context, DataTable &table) {
 			    {unindexed_row_ranges[i].start, MinValue<row_t>(unindexed_row_ranges[i].end, bounds_end)});
 		}
 		try {
-			auto sink_state = InitializeIndexSinkState(context, num_unindexed_rows, row_ids.get());
+			const IndexSinkInput sink_input(bounds, num_unindexed_rows, num_threads);
+			auto sink_state = InitializeIndexSinkState(context, sink_input);
 			// One scan for the row group's ranges, each of them retired on its own
 			ScanAndSinkRows(table, row_group_ranges, *sink_state, rows_returned);
-			const auto embeddings = sink_state->Cast<VSSIndexSinkState>().embeddings;
 			const idx_t count = sink_state->count;
 			for (idx_t i = 0; i < row_group_ranges.size(); i++) {
 				if (rows_returned[i] == 0) {
@@ -716,11 +712,11 @@ void VSSIndex::SyncWithTable(ClientContext &context, DataTable &table) {
 				RemoveRowGroupsOverlapping(bounds.row_start, bounds_end);
 				row_group_idx = optional_idx();
 			}
+			// The scanned rows are appended to the mirror if it exists. Otherwise, the scanned rows build a new mirror.
 			if (row_group_idx.IsValid()) {
-				AppendRows(row_group_idx.GetIndex(), row_ids.get(), embeddings, count, &executor);
+				AppendToRowGroupIndex(*sink_state, row_group_idx.GetIndex());
 			} else {
-				SetUpIndexForRowGroup(row_ids.get(), embeddings, count, bounds.row_start, bounds.count,
-				                      IsClosedRowGroup(table, bounds), &executor);
+				BuildRowGroupIndex(*sink_state, table);
 			}
 		} catch (...) {
 			// The row group's staged rows stay staged: the next sync appends them again (rows already appended are
@@ -748,33 +744,52 @@ void VSSIndex::SyncWithTable(ClientContext &context, DataTable &table) {
 	// headroom.
 	MarkClosedRowGroups(table);
 
-	// The closed row groups the sync loaded fully go back to temporary chains; the open one stays on the heap.
-	if (cluster_paging) {
-		WriteTemporaryChains();
-	}
+	FinishSync();
 
-	// The sync's appends, deletes and removed row groups changed the self-managed memory without reserving it.
-	// Reserving the difference between the size now and what is reserved makes the two equal (it frees when the index
-	// shrank).
+	// After a sync, the self-managed size of the index can differ from the reserved memory. Reserving the difference
+	// makes the two equal again. A negative difference frees memory that the index no longer uses.
 	const auto self_managed_bytes = static_cast<int64_t>(vss_wrapper->GetSelfManagedMemorySizeInBytes());
 	UpdateReservedMemory(self_managed_bytes - static_cast<int64_t>(reserved_memory_bytes.load()));
 }
 
-unique_ptr<IndexSinkState> VSSIndex::InitializeIndexSinkState(ClientContext &context, const idx_t num_rows,
-                                                              row_t *const row_ids) {
-	auto executor = make_uniq<DuckDBParallelExecutor>(
-	    context, static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
-	// One DuckDB row group of transformed embeddings at a time, like the create sink, in a DuckDB buffer of the rows
-	// fetched.
+void VSSIndex::FinishSync() {
+	// The closed row groups the sync loaded fully go back to temporary chains; the open one stays on the heap.
+	if (cluster_paging) {
+		WriteTemporaryChains();
+	}
+}
+
+unique_ptr<IndexSinkState> VSSIndex::InitializeIndexSinkState(ClientContext &context,
+                                                              const IndexSinkInput &sink_input) {
+	D_ASSERT(sink_input.num_rows <= sink_input.row_group.count);
+	// One DuckDB row group of transformed embeddings at a time, in a DuckDB buffer of the rows fetched.
 	const auto num_dimensions = GetNumDimensions();
-	auto embeddings_buffer = buffer_manager.Allocate(MemoryTag::EXTENSION, num_rows * num_dimensions * sizeof(float),
-	                                                 /*can_destroy=*/false);
-	auto state = make_uniq<VSSIndexSinkState>(num_dimensions,
-	                                          reinterpret_cast<float *>(embeddings_buffer.GetDataMutable()), row_ids,
-	                                          /*rotate=*/true, executor.get());
+	auto embeddings_buffer =
+	    buffer_manager.Allocate(MemoryTag::EXTENSION, sink_input.num_rows * num_dimensions * sizeof(float),
+	                            /*can_destroy=*/false);
+	auto state = make_uniq<VSSIndexSinkState>(
+	    context, sink_input, reinterpret_cast<float *>(embeddings_buffer.GetDataMutable()), /*rotate=*/true);
 	state->embeddings_buffer = std::move(embeddings_buffer);
-	state->owned_executor = std::move(executor);
+	state->row_ids = make_uniq_array_uninitialized<row_t>(sink_input.num_rows);
 	return std::move(state);
+}
+
+void VSSIndex::BuildRowGroupIndex(IndexSinkState &sink_state, DataTable &table) {
+	const auto &state = sink_state.Cast<VSSIndexSinkState>();
+	if (state.count == 0) {
+		return;
+	}
+	const auto &input = state.input;
+	SetUpIndexForRowGroup(state.row_ids.get(), state.embeddings, state.count, input.row_group.row_start,
+	                      input.row_group.count, IsClosedRowGroup(table, input.row_group), state.executor.get());
+}
+
+void VSSIndex::AppendToRowGroupIndex(IndexSinkState &sink_state, const idx_t row_group_idx) {
+	const auto &state = sink_state.Cast<VSSIndexSinkState>();
+	if (state.count == 0) {
+		return;
+	}
+	AppendRows(row_group_idx, state.row_ids.get(), state.embeddings, state.count, state.executor.get());
 }
 
 void VSSIndex::FitSAQModelForCreate(ClientContext &context, DataTable &table) {
@@ -799,10 +814,11 @@ void VSSIndex::FitSAQModelForCreate(ClientContext &context, DataTable &table) {
 	std::vector<idx_t> rows_returned;
 	for (const auto &row_group : physical_row_groups) {
 		const row_t end = row_group.row_start + static_cast<row_t>(row_group.count);
+		const IndexSinkInput sink_input(row_group, MinValue<idx_t>(row_group.count, rows_per_row_group),
+		                                executor.NumWorkers());
 		// The identity rotation of an index not fitted yet leaves the rows as they are.
-		VSSIndexSinkState sink_state(num_dimensions, sample.get() + num_sampled * num_dimensions,
-		                             /*row_ids=*/nullptr, /*rotate=*/false, &executor,
-		                             MinValue<idx_t>(row_group.count, rows_per_row_group));
+		VSSIndexSinkState sink_state(context, sink_input, sample.get() + num_sampled * num_dimensions,
+		                             /*rotate=*/false, sink_input.num_rows);
 		ScanAndSinkRows(table, {{row_group.row_start, end}}, sink_state, rows_returned);
 		num_sampled += sink_state.count;
 	}

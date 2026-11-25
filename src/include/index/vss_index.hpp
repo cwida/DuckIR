@@ -97,12 +97,45 @@ private:
 };
 
 // todo@gropaul: Move to RGPartitionedIndex
+// What VSSIndex::Sink does with a row the index cannot take, for VSS an embedding with NaN, infinite or too large
+// values, for FTS e.g. rows that are no valid UTF-8: CREATE INDEX throws, the sync skips it
+enum class UnindexableRowAction : uint8_t { SKIP, THROW };
+
+// The rows of one DuckDB row group a sink state takes (VSSIndex::InitializeIndexSinkState).
+struct IndexSinkInput {
+	IndexSinkInput(const VSSRowGroupBounds row_group, const idx_t num_rows, const idx_t num_threads,
+	               const UnindexableRowAction unindexable_row_action = UnindexableRowAction::SKIP)
+	    : row_group(row_group), num_rows(num_rows), num_threads(num_threads),
+	      unindexable_row_action(unindexable_row_action) {
+	}
+
+	// The DuckDB row group the rows are in.
+	VSSRowGroupBounds row_group;
+	// At most row_group.count.
+	idx_t num_rows;
+	// The threads the state's work on its row group runs on.
+	idx_t num_threads;
+	UnindexableRowAction unindexable_row_action;
+};
+
 // What an index keeps while it takes rows chunk by chunk (VSSIndex::Sink), one per concurrent build.
 struct IndexSinkState {
+	explicit IndexSinkState(const IndexSinkInput &input) : input(input), indexable_sel(STANDARD_VECTOR_SIZE) {
+	}
 	virtual ~IndexSinkState() = default;
 
-	// The rows the sink took.
+	const IndexSinkInput input;
+	// The rows the sink took, and their ids: set by InitializeIndexSinkState, null for the SAQ sample.
 	idx_t count = 0;
+	unique_array<row_t> row_ids;
+	// Selection of Rows that are not NULL and not unindexable (e.g., wrong vector dimension)
+	SelectionVector indexable_sel;
+
+	// Whether the state's work on its row group runs on several threads. Other states can still run at the same
+	// time on other row groups (CREATE INDEX's concurrent builds)
+	bool IsParallel() const {
+		return input.num_threads > 1;
+	}
 
 	template <class TARGET>
 	TARGET &Cast() {
@@ -111,27 +144,21 @@ struct IndexSinkState {
 	}
 };
 
-// What VSSIndex::Sink does with an embedding with NaN, infinite or too large values.
-enum class NonFiniteEmbeddingAction : uint8_t { SKIP, THROW };
-
-// VSSIndex::Sink writes up to `max_rows` non-NULL embeddings to `embeddings`, rotated if `rotate`, and their ids to
-// `row_ids` if not null. Non-finite ones it skips or throws on, by `non_finite_action`.
+// VSSIndex::Sink writes up to `max_rows` non-NULL embeddings to `embeddings`, rotated if `rotate`. Non-finite ones it
+// skips or throws on, by `unindexable_row_action`.
 struct VSSIndexSinkState : public IndexSinkState {
-	VSSIndexSinkState(idx_t num_dimensions, float *embeddings, row_t *row_ids, bool rotate,
-	                  PDX::ParallelExecutor *executor, idx_t max_rows = NumericLimits<idx_t>::Maximum());
+	VSSIndexSinkState(ClientContext &context, const IndexSinkInput &input, float *embeddings, bool rotate,
+	                  idx_t max_rows = NumericLimits<idx_t>::Maximum());
 
 	float *const embeddings;
-	row_t *const row_ids;
 	const bool rotate;
-	PDX::ParallelExecutor *const executor;
+	// Runs on input.num_threads threads.
+	const unique_ptr<PDX::ParallelExecutor> executor;
 	const idx_t max_rows;
-	NonFiniteEmbeddingAction non_finite_action = NonFiniteEmbeddingAction::SKIP;
-	// A chunk's selected embeddings before the rotation.
+	// A chunk's selected embeddings before the rotation, allocated by the first chunk that needs it.
 	unique_array<float> raw_embeddings;
-	SelectionVector indexable_sel;
-	// Set by InitializeIndexSinkState, which owns the buffer and the executor of a row group build.
+	// Set by InitializeIndexSinkState, which owns the buffer of a row group build.
 	BufferHandle embeddings_buffer;
-	unique_ptr<PDX::ParallelExecutor> owned_executor;
 };
 
 class VSSIndex : public BoundIndex {
@@ -230,12 +257,23 @@ private:
 	// Scans the committed rows of `ranges` into `sink_state` until Sink returns FINISHED. rows_returned: per range.
 	void ScanAndSinkRows(DataTable &table, const std::vector<VSSRowRange> &ranges, IndexSinkState &sink_state,
 	                     std::vector<idx_t> &rows_returned, bool all_committed = false);
+
+public:
 	// todo@gropaul: Should become a virtual of RGPartitionedIndex, implemented by each index
 	// Takes the `count` rows of `chunk` that `sel` selects, all of them if it is unset.
 	SinkResultType Sink(IndexSinkState &sink_state, DataChunk &chunk, const SelectionVector &sel, idx_t count);
 	// todo@gropaul: Becomes a virtual of RGPartitionedIndex, implemented by each index
-	// A sink state for `num_rows` rows of one row group, their ids written to `row_ids`.
-	unique_ptr<IndexSinkState> InitializeIndexSinkState(ClientContext &context, idx_t num_rows, row_t *row_ids);
+	// A sink state for `sink_input.num_rows` rows of one row group.
+	unique_ptr<IndexSinkState> InitializeIndexSinkState(ClientContext &context, const IndexSinkInput &sink_input);
+	// todo@gropaul: Move up to RGPartitionedIndex
+	// Builds the state's row group from the rows it took. Two states of one row group (a row group DuckDB split over
+	// scan tasks) append the second's rows.
+	void BuildRowGroupIndex(IndexSinkState &sink_state, DataTable &table);
+	// todo@gropaul: Move up to RGPartitionedIndex
+	// Adds the state's rows to the index's row group at row_group_idx, which already exists.
+	void AppendToRowGroupIndex(IndexSinkState &sink_state, idx_t row_group_idx);
+
+private:
 	// Indexes the `indexable_count` rows the state's indexable_sel selects in the flattened `chunk`, or its first ones
 	// without HAS_SEL.
 	template <bool HAS_SEL>
@@ -286,6 +324,12 @@ private:
 	// - No unindexed rows
 	// - Every mirrored row group matches its DuckDB row group.
 	bool IsInSyncWithTable(DataTable &table) const;
+	// todo@gropaul: Move up to RGPartitionedIndex
+	// The index's own work at the end of a sync, after the closed row groups are marked.
+	void FinishSync();
+	// todo@gropaul: Move up to RGPartitionedIndex
+	// The memory the index holds outside DuckDB's buffers, which the index reserves itself (UpdateReservedMemory).
+	uint64_t GetSelfManagedMemorySizeInBytes() const;
 
 	// The index's storage: the directory chain points to the rotation chain, the SAQ model chain and to each row
 	// group's chain.
