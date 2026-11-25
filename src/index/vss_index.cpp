@@ -316,113 +316,190 @@ void VSSIndex::DeleteStaleRowIds(const std::vector<VSSRowRange> &ranges) {
 	});
 }
 
-idx_t VSSIndex::FetchRows(DataTable &table, const std::vector<VSSRowRange> &ranges, float *const embeddings,
-                          std::vector<idx_t> &rows_returned, row_t *const row_ids, const bool rotate,
-                          PDX::ParallelExecutor *const executor, const idx_t max_rows, const bool all_committed) {
-	rows_returned.assign(ranges.size(), 0);
-	// Scans every committed row, whatever the calling transaction's snapshot. The mirror
-	// holds the committed state, and rows a query must not see are dropped when it fetches its results.
-	const TransactionData committed(
-	    MAX_TRANSACTION_ID, all_committed ? VisibilityBound::AllCommitted()
-	                                      : VisibilityBound::Through(DuckTransactionManager::Get(db).GetLastCommit()));
-	const vector<StorageIndex> column_ids {StorageIndex(GetColumnIds()[0]), StorageIndex()};
-	DataChunk chunk;
-	chunk.Initialize(Allocator::Get(db), {logical_types[0], LogicalType::ROW_TYPE});
-	const auto num_dimensions = GetNumDimensions();
-	auto raw_embeddings = make_uniq_array_uninitialized<float>(STANDARD_VECTOR_SIZE * num_dimensions);
+template <bool HAS_SEL>
+static idx_t GetOptionalIndex(const SelectionVector &sel, const idx_t idx) {
+	return HAS_SEL ? sel.get_index_unsafe(idx) : idx;
+}
 
-	idx_t count = 0;
-	idx_t range_idx = 0;
-	while (range_idx < ranges.size() && count < max_rows) {
-		if (ranges[range_idx].start >= ranges[range_idx].end) {
-			range_idx++;
+template <bool HAS_SEL>
+SinkResultType VSSIndex::SinkInternal(IndexSinkState &sink_state, DataChunk &chunk, const SelectionVector &sel,
+                                      const idx_t count) {
+	auto &state = sink_state.Cast<VSSIndexSinkState>();
+	const auto num_dimensions = GetNumDimensions();
+	auto &embedding_column = chunk.data[0];
+	embedding_column.Flatten();
+	const auto &validity = FlatVector::Validity(embedding_column);
+	const auto scanned_embeddings = FlatVector::GetData<float>(ArrayVector::GetChild(embedding_column));
+	const auto scanned_row_ids = FlatVector::GetData<row_t>(chunk.data[1]);
+	// Without a rotation, the rows go straight to the output.
+	float *const batch_embeddings =
+	    state.rotate ? state.raw_embeddings.get() : state.embeddings + state.count * num_dimensions;
+	idx_t batch_count = 0;
+	for (idx_t sel_idx = 0; sel_idx < count && state.count + batch_count < state.max_rows; sel_idx++) {
+		const idx_t i = GetOptionalIndex<HAS_SEL>(sel, sel_idx);
+		// Like NULL embeddings, the ones CREATE INDEX rejects are not indexed.
+		if (!validity.RowIsValid(i) || !IsFiniteEmbedding(scanned_embeddings + i * num_dimensions, num_dimensions)) {
 			continue;
 		}
-		// Ranges less than a vector apart share one scan: the scan of each would read that vector anyway.
-		idx_t last_range_idx = range_idx;
-		while (last_range_idx + 1 < ranges.size() && ranges[last_range_idx + 1].start - ranges[last_range_idx].end <
-		                                                 static_cast<row_t>(STANDARD_VECTOR_SIZE)) {
-			last_range_idx++;
+		memcpy(batch_embeddings + batch_count * num_dimensions, scanned_embeddings + i * num_dimensions,
+		       num_dimensions * sizeof(float));
+		if (state.row_ids) {
+			state.row_ids[state.count + batch_count] = scanned_row_ids[i];
 		}
-		TableScanState scan_state;
-		scan_state.Initialize(column_ids);
-		table.GetRowGroupCollection()->InitializeScanWithOffset(QueryContext(), scan_state.table_state, column_ids,
-		                                                        static_cast<idx_t>(ranges[range_idx].start),
-		                                                        static_cast<idx_t>(ranges[last_range_idx].end));
-		while (count < max_rows) {
-			chunk.Reset();
-			// Deleted rows are gone, NULL embeddings are NULL.
-			scan_state.table_state.Scan(ScanOptions(committed), chunk);
-			if (chunk.size() == 0) {
-				break;
+		batch_count++;
+	}
+	if (batch_count == 0) {
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+	if (state.rotate) {
+		vss_wrapper->PreprocessEmbeddings(state.raw_embeddings.get(), state.embeddings + state.count * num_dimensions,
+		                                  batch_count, state.executor);
+	} else {
+		vss_wrapper->NormalizeEmbeddings(batch_embeddings, batch_count);
+	}
+	state.count += batch_count;
+	// FINISHED only for the SAQ sample, which sets max_rows.
+	return state.count < state.max_rows ? SinkResultType::NEED_MORE_INPUT : SinkResultType::FINISHED;
+}
+
+SinkResultType VSSIndex::Sink(IndexSinkState &sink_state, DataChunk &chunk, const SelectionVector &sel,
+                              const idx_t count) {
+	if (sel.IsSet()) {
+		return SinkInternal<true>(sink_state, chunk, sel, count);
+	}
+	return SinkInternal<false>(sink_state, chunk, sel, count);
+}
+
+VSSIndexSinkState::VSSIndexSinkState(const idx_t num_dimensions, float *const embeddings, row_t *const row_ids,
+                                     const bool rotate, PDX::ParallelExecutor *const executor, const idx_t max_rows)
+    : embeddings(embeddings), row_ids(row_ids), rotate(rotate), executor(executor), max_rows(max_rows),
+      raw_embeddings(make_uniq_array_uninitialized<float>(STANDARD_VECTOR_SIZE * num_dimensions)) {
+}
+
+// todo@gropaul: Move to RGPartitionedIndex
+void VSSIndex::ScanAndSinkRows(DataTable &table, const std::vector<VSSRowRange> &ranges, IndexSinkState &sink_state,
+                               std::vector<idx_t> &rows_returned, const bool all_committed) {
+	TableRangeScanner scanner(table, Allocator::Get(db), GetScanColumnIds(), GetScanTypes(),
+	                          GetCommittedSnapshot(all_committed), ranges);
+	while (scanner.Next()) {
+		// A sink can decide to stop, for example, if it only needs a sample of rows.
+		const auto sink_result = Sink(sink_state, scanner.chunk, scanner.sel, scanner.sel_count);
+		if (sink_result == SinkResultType::FINISHED) {
+			break;
+		}
+	}
+	rows_returned = std::move(scanner.rows_returned);
+}
+
+TableRangeScanner::TableRangeScanner(DataTable &table, Allocator &allocator, vector<StorageIndex> column_ids_p,
+                                     const vector<LogicalType> &types, const TransactionData &transaction,
+                                     const std::vector<VSSRowRange> &row_id_ranges)
+    : rows_returned(row_id_ranges.size(), 0), table(table), scan_options(transaction),
+      column_ids(std::move(column_ids_p)), row_id_ranges(row_id_ranges) {
+	chunk.Initialize(allocator, types);
+}
+
+// todo@gropaul: Move to RGPartitionedIndex
+// Scans every committed row, whatever the calling transaction's snapshot. The mirror
+// holds the committed state, and rows a query must not see are dropped when it fetches its results.
+TransactionData VSSIndex::GetCommittedSnapshot(const bool all_committed) const {
+	return TransactionData(MAX_TRANSACTION_ID,
+	                       all_committed ? VisibilityBound::AllCommitted()
+	                                     : VisibilityBound::Through(DuckTransactionManager::Get(db).GetLastCommit()));
+}
+
+// todo@gropaul: Move to RGPartitionedIndex
+vector<StorageIndex> VSSIndex::GetScanColumnIds() const {
+	return {StorageIndex(GetColumnIds()[0]), StorageIndex()};
+}
+
+// todo@gropaul: Move to RGPartitionedIndex
+vector<LogicalType> VSSIndex::GetScanTypes() const {
+	return {logical_types[0], LogicalType::ROW_TYPE};
+}
+
+bool TableRangeScanner::Next() {
+	const auto &ranges = row_id_ranges;
+	while (true) {
+		if (!table_scan_state) {
+			while (current_ranges.start < ranges.size() && ranges[current_ranges.start].IsEmpty()) {
+				current_ranges.start++;
 			}
-			auto &embedding_column = chunk.data[0];
-			embedding_column.Flatten();
-			chunk.data[1].Flatten();
-			const auto &validity = FlatVector::Validity(embedding_column);
-			const auto scanned_embeddings = FlatVector::GetData<float>(ArrayVector::GetChild(embedding_column));
-			const auto scanned_row_ids = FlatVector::GetData<row_t>(chunk.data[1]);
-			// Without a rotation, the rows go straight to the output.
-			float *const batch_embeddings = rotate ? raw_embeddings.get() : embeddings + count * num_dimensions;
-			idx_t batch_count = 0;
-			const idx_t chunk_size = chunk.size();
-			for (idx_t i = 0; i < chunk_size && count + batch_count < max_rows; i++) {
-				// The scan starts at the vector that holds the first range's start, and reads the gaps between ranges.
-				while (range_idx < last_range_idx && ranges[range_idx].end <= scanned_row_ids[i]) {
-					range_idx++;
-				}
-				if (scanned_row_ids[i] < ranges[range_idx].start || scanned_row_ids[i] >= ranges[range_idx].end) {
-					continue;
-				}
-				rows_returned[range_idx]++;
-				// Like NULL embeddings, the ones CREATE INDEX rejects are not indexed.
-				if (!validity.RowIsValid(i) ||
-				    !IsFiniteEmbedding(scanned_embeddings + i * num_dimensions, num_dimensions)) {
-					continue;
-				}
-				memcpy(batch_embeddings + batch_count * num_dimensions, scanned_embeddings + i * num_dimensions,
-				       num_dimensions * sizeof(float));
-				if (row_ids) {
-					row_ids[count + batch_count] = scanned_row_ids[i];
-				}
-				batch_count++;
+			if (current_ranges.start >= ranges.size()) {
+				return false;
 			}
-			if (batch_count == 0) {
+			// Ranges less than a vector apart share one scan: the scan of each would read that vector anyway.
+			current_ranges.end = current_ranges.start + 1;
+			while (current_ranges.end < ranges.size() &&
+			       ranges[current_ranges.end].start - ranges[current_ranges.end - 1].end <
+			           static_cast<row_t>(STANDARD_VECTOR_SIZE)) {
+				current_ranges.end++;
+			}
+			table_scan_state = make_uniq<TableScanState>();
+			table_scan_state->Initialize(column_ids);
+			table.GetRowGroupCollection()->InitializeScanWithOffset(
+			    QueryContext(), table_scan_state->table_state, column_ids,
+			    static_cast<idx_t>(ranges[current_ranges.start].start),
+			    static_cast<idx_t>(ranges[current_ranges.end - 1].end));
+		}
+		chunk.Reset();
+		// Deleted rows are gone, NULL values are NULL.
+		table_scan_state->table_state.Scan(scan_options, chunk);
+		if (chunk.size() == 0) {
+			table_scan_state.reset();
+			current_ranges.start = current_ranges.end;
+			continue;
+		}
+		// The row ids are the last column. The index flattens the other columns if it needs to.
+		auto &row_id_column = chunk.data[chunk.ColumnCount() - 1];
+		row_id_column.Flatten();
+		const auto scanned_row_ids = FlatVector::GetData<row_t>(row_id_column);
+		const idx_t chunk_size = chunk.size();
+		// Row ids ascend: a chunk whose first and last row are in the current range needs no selection.
+		const auto &range = ranges[current_ranges.start];
+		if (range.Contains(scanned_row_ids[0]) && range.Contains(scanned_row_ids[chunk_size - 1])) {
+			rows_returned[current_ranges.start] += chunk_size;
+			sel.Initialize(nullptr, 0);
+			sel_count = chunk_size;
+			return true;
+		}
+		if (!sel.IsSet()) {
+			sel.Initialize(STANDARD_VECTOR_SIZE);
+		}
+		sel_count = 0;
+		for (idx_t i = 0; i < chunk_size; i++) {
+			// The scan starts at the vector that holds the first range's start, and reads the gaps between ranges.
+			while (current_ranges.start + 1 < current_ranges.end &&
+			       ranges[current_ranges.start].end <= scanned_row_ids[i]) {
+				current_ranges.start++;
+			}
+			if (!ranges[current_ranges.start].Contains(scanned_row_ids[i])) {
 				continue;
 			}
-			if (rotate) {
-				vss_wrapper->PreprocessEmbeddings(raw_embeddings.get(), embeddings + count * num_dimensions,
-				                                  batch_count, executor);
-			} else {
-				vss_wrapper->NormalizeEmbeddings(batch_embeddings, batch_count);
-			}
-			count += batch_count;
+			rows_returned[current_ranges.start]++;
+			sel.set_index(sel_count++, i);
 		}
-		range_idx = last_range_idx + 1;
+		if (sel_count > 0) {
+			return true;
+		}
 	}
-	return count;
 }
 
 idx_t VSSIndex::FetchCommittedRowIds(DataTable &table, const row_t start, const row_t end, row_t *const row_ids) {
-	const TransactionData committed(MAX_TRANSACTION_ID,
-	                                VisibilityBound::Through(DuckTransactionManager::Get(db).GetLastCommit()));
-	const vector<StorageIndex> column_ids {StorageIndex()};
-	TableScanState scan_state;
-	scan_state.Initialize(column_ids);
-	table.GetRowGroupCollection()->InitializeScanWithOffset(QueryContext(), scan_state.table_state, column_ids,
-	                                                        static_cast<idx_t>(start), static_cast<idx_t>(end));
-	DataChunk chunk;
-	chunk.Initialize(Allocator::Get(db), {LogicalType::ROW_TYPE});
+	const auto committed = GetCommittedSnapshot();
+	const std::vector<VSSRowRange> ranges {{start, end}};
+	TableRangeScanner scanner(table, Allocator::Get(db), {StorageIndex()}, {LogicalType::ROW_TYPE}, committed, ranges);
 	idx_t count = 0;
-	while (true) {
-		chunk.Reset();
-		scan_state.table_state.Scan(ScanOptions(committed), chunk);
-		if (chunk.size() == 0) {
-			break;
+	while (scanner.Next()) {
+		const auto scanned_row_ids = FlatVector::GetData<row_t>(scanner.chunk.data[0]);
+		if (!scanner.sel.IsSet()) {
+			memcpy(row_ids + count, scanned_row_ids, scanner.sel_count * sizeof(row_t));
+			count += scanner.sel_count;
+			continue;
 		}
-		chunk.data[0].Flatten();
-		memcpy(row_ids + count, FlatVector::GetData<row_t>(chunk.data[0]), chunk.size() * sizeof(row_t));
-		count += chunk.size();
+		for (idx_t sel_idx = 0; sel_idx < scanner.sel_count; sel_idx++) {
+			row_ids[count++] = scanned_row_ids[scanner.sel.get_index(sel_idx)];
+		}
 	}
 	return count;
 }
@@ -464,13 +541,6 @@ void VSSIndex::SyncWithTable(ClientContext &context, DataTable &table) {
 	DuckDBParallelExecutor executor(context,
 	                                static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
 
-	// One DuckDB row group of transformed embeddings at a time, like the create sink, in a DuckDB buffer of the rows
-	// fetched.
-	const auto num_dimensions = GetNumDimensions();
-	const auto allocate_embeddings = [&](const idx_t num_rows) {
-		return buffer_manager.Allocate(MemoryTag::EXTENSION, num_rows * num_dimensions * sizeof(float),
-		                               /*can_destroy=*/false);
-	};
 	auto row_ids = make_uniq_array<row_t>(GetLargestRowGroupCount(table));
 
 	// Row groups a checkpoint merged or dropped: their mirrors go, and the ones still in the table are rebuilt.
@@ -483,13 +553,13 @@ void VSSIndex::SyncWithTable(ClientContext &context, DataTable &table) {
 		}
 		const row_t bounds_end = bounds.row_start + static_cast<row_t>(bounds.count);
 		try {
-			auto embeddings_buffer = allocate_embeddings(bounds.count);
-			const auto embeddings = reinterpret_cast<float *>(embeddings_buffer.GetDataMutable());
+			auto sink_state = InitializeIndexSinkState(context, bounds.count, row_ids.get());
 			// As of every commit: a DELETE in flight already removed some of these rows from the index. The rows of an
 			// INSERT in flight it brings are in the inbox, whose ids DeleteStaleRowIds evicts later in this sync.
-			const idx_t count = FetchRows(table, {{bounds.row_start, bounds_end}}, embeddings, rows_returned,
-			                              row_ids.get(), /*rotate=*/true, &executor, NumericLimits<idx_t>::Maximum(),
-			                              /*all_committed=*/true);
+			ScanAndSinkRows(table, {{bounds.row_start, bounds_end}}, *sink_state, rows_returned,
+			                /*all_committed=*/true);
+			const auto embeddings = sink_state->Cast<VSSIndexSinkState>().embeddings;
+			const idx_t count = sink_state->count;
 			if (count > 0) {
 				SetUpIndexForRowGroup(row_ids.get(), embeddings, count, bounds.row_start, bounds.count,
 				                      IsClosedRowGroup(table, bounds), &executor);
@@ -558,11 +628,11 @@ void VSSIndex::SyncWithTable(ClientContext &context, DataTable &table) {
 			    {unindexed_row_ranges[i].start, MinValue<row_t>(unindexed_row_ranges[i].end, bounds_end)});
 		}
 		try {
-			auto embeddings_buffer = allocate_embeddings(num_unindexed_rows);
-			const auto embeddings = reinterpret_cast<float *>(embeddings_buffer.GetDataMutable());
+			auto sink_state = InitializeIndexSinkState(context, num_unindexed_rows, row_ids.get());
 			// One scan for the row group's ranges, each of them retired on its own
-			const idx_t count = FetchRows(table, row_group_ranges, embeddings, rows_returned, row_ids.get(),
-			                              /*rotate=*/true, &executor);
+			ScanAndSinkRows(table, row_group_ranges, *sink_state, rows_returned);
+			const auto embeddings = sink_state->Cast<VSSIndexSinkState>().embeddings;
+			const idx_t count = sink_state->count;
 			for (idx_t i = 0; i < row_group_ranges.size(); i++) {
 				if (rows_returned[i] == 0) {
 					// Not committed yet: a later sync indexes them.
@@ -630,6 +700,23 @@ void VSSIndex::SyncWithTable(ClientContext &context, DataTable &table) {
 	UpdateReservedMemory(self_managed_bytes - static_cast<int64_t>(reserved_memory_bytes.load()));
 }
 
+unique_ptr<IndexSinkState> VSSIndex::InitializeIndexSinkState(ClientContext &context, const idx_t num_rows,
+                                                              row_t *const row_ids) {
+	auto executor = make_uniq<DuckDBParallelExecutor>(
+	    context, static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
+	// One DuckDB row group of transformed embeddings at a time, like the create sink, in a DuckDB buffer of the rows
+	// fetched.
+	const auto num_dimensions = GetNumDimensions();
+	auto embeddings_buffer = buffer_manager.Allocate(MemoryTag::EXTENSION, num_rows * num_dimensions * sizeof(float),
+	                                                 /*can_destroy=*/false);
+	auto state = make_uniq<VSSIndexSinkState>(num_dimensions,
+	                                          reinterpret_cast<float *>(embeddings_buffer.GetDataMutable()), row_ids,
+	                                          /*rotate=*/true, executor.get());
+	state->embeddings_buffer = std::move(embeddings_buffer);
+	state->owned_executor = std::move(executor);
+	return std::move(state);
+}
+
 void VSSIndex::FitSAQModelForCreate(ClientContext &context, DataTable &table) {
 	// No row group can reach MIN_EMBEDDINGS_FOR_CLUSTERING rows: they are all Flat, and the first sync that clusters
 	// one fits.
@@ -653,9 +740,11 @@ void VSSIndex::FitSAQModelForCreate(ClientContext &context, DataTable &table) {
 	for (const auto &row_group : physical_row_groups) {
 		const row_t end = row_group.row_start + static_cast<row_t>(row_group.count);
 		// The identity rotation of an index not fitted yet leaves the rows as they are.
-		num_sampled += FetchRows(table, {{row_group.row_start, end}}, sample.get() + num_sampled * num_dimensions,
-		                         rows_returned, /*row_ids=*/nullptr, /*rotate=*/false, &executor,
-		                         MinValue<idx_t>(row_group.count, rows_per_row_group));
+		VSSIndexSinkState sink_state(num_dimensions, sample.get() + num_sampled * num_dimensions,
+		                             /*row_ids=*/nullptr, /*rotate=*/false, &executor,
+		                             MinValue<idx_t>(row_group.count, rows_per_row_group));
+		ScanAndSinkRows(table, {{row_group.row_start, end}}, sink_state, rows_returned);
+		num_sampled += sink_state.count;
 	}
 	if (num_sampled == 0) {
 		return;

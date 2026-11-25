@@ -9,6 +9,9 @@
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/storage_lock.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/common/enums/operator_result_type.hpp"
+#include "duckdb/common/enums/scan_options.hpp"
 #include <atomic>
 #include <condition_variable>
 
@@ -20,10 +23,21 @@
 
 namespace duckdb {
 
-struct VSSRowRange {
-	row_t start; // [start, end)
-	row_t end;
+// [start, end)
+template <class T>
+struct Range {
+	T start;
+	T end;
+
+	bool Contains(const T value) const {
+		return start <= value && value < end;
+	}
+	bool IsEmpty() const {
+		return start >= end;
+	}
 };
+
+using VSSRowRange = Range<row_t>;
 
 struct VSSIndexStats {
 	string metric;
@@ -49,6 +63,70 @@ struct VSSIndexStats {
 // This triggers OOM when the ARRAY[float] column is large.
 // Therefore, CREATE INDEX reserves this memory for the blocks it reads.
 static constexpr idx_t DUCKDB_TABLE_SCAN_METADATA_BYTES_PER_BLOCK = 700;
+
+// todo@gropaul: Move to its own file in core/
+// Scans `column_ids` (row id last) of `row_id_ranges` (sorted, disjoint) as of its own snapshot, not the calling
+// query's.
+class TableRangeScanner {
+public:
+	TableRangeScanner(DataTable &table, Allocator &allocator, vector<StorageIndex> column_ids,
+	                  const vector<LogicalType> &types, const TransactionData &transaction,
+	                  const std::vector<VSSRowRange> &row_id_ranges);
+
+	// Per range, NULL values included.
+	std::vector<idx_t> rows_returned;
+	// The rows Next read last. `sel` selects the `sel_count` inside the ranges, unset when all are.
+	DataChunk chunk;
+	SelectionVector sel;
+	idx_t sel_count = 0;
+
+public:
+	// Reads the next chunk with rows inside the ranges, row ids flat; false once all ranges are read.
+	bool Next();
+
+private:
+	DataTable &table;
+	const ScanOptions scan_options;
+	const vector<StorageIndex> column_ids;
+	// The current TableScanState reads row_id_ranges[current_ranges.start, current_ranges.end); start moves to the
+	// range the last row matched.
+	const std::vector<VSSRowRange> &row_id_ranges;
+	Range<idx_t> current_ranges {0, 0};
+	// One per range group: DuckDB starts a TableScanState only once.
+	unique_ptr<TableScanState> table_scan_state;
+};
+
+// todo@gropaul: Move to RGPartitionedIndex
+// What an index keeps while it takes rows chunk by chunk (VSSIndex::Sink), one per concurrent build.
+struct IndexSinkState {
+	virtual ~IndexSinkState() = default;
+
+	// The rows the sink took.
+	idx_t count = 0;
+
+	template <class TARGET>
+	TARGET &Cast() {
+		DynamicCastCheck<TARGET>(this);
+		return reinterpret_cast<TARGET &>(*this);
+	}
+};
+
+// VSSIndex::Sink copies up to `max_rows` non-NULL, finite embeddings, rotated if `rotate`, and their ids if not null.
+struct VSSIndexSinkState : public IndexSinkState {
+	VSSIndexSinkState(idx_t num_dimensions, float *embeddings, row_t *row_ids, bool rotate,
+	                  PDX::ParallelExecutor *executor, idx_t max_rows = NumericLimits<idx_t>::Maximum());
+
+	float *const embeddings;
+	row_t *const row_ids;
+	const bool rotate;
+	PDX::ParallelExecutor *const executor;
+	const idx_t max_rows;
+	// A chunk's embeddings before the rotation.
+	unique_array<float> raw_embeddings;
+	// Set by InitializeIndexSinkState, which owns the buffer and the executor of a row group build.
+	BufferHandle embeddings_buffer;
+	unique_ptr<PDX::ParallelExecutor> owned_executor;
+};
 
 class VSSIndex : public BoundIndex {
 public:
@@ -143,14 +221,22 @@ private:
 	                PDX::ParallelExecutor *executor);
 	void DeleteRow(row_t row_id);
 
-	// Scans the committed rows of `ranges` (sorted, disjoint) whose embedding is not NULL into `embeddings`, normalized
-	// when the metric needs it and rotated if `rotate`, and their ids into `row_ids` unless it is null. Returns how
-	// many (at most `max_rows`). `rows_returned[i]` counts every committed row the table returned in ranges[i], NULL
-	// embeddings included. Ranges less than a vector apart share one scan. As of the last published commit, or with
-	// `all_committed` of every commit, published or not.
-	idx_t FetchRows(DataTable &table, const std::vector<VSSRowRange> &ranges, float *embeddings,
-	                std::vector<idx_t> &rows_returned, row_t *row_ids, bool rotate, PDX::ParallelExecutor *executor,
-	                idx_t max_rows = NumericLimits<idx_t>::Maximum(), bool all_committed = false);
+	// Scans the committed rows of `ranges` into `sink_state` until Sink returns FINISHED. rows_returned: per range.
+	void ScanAndSinkRows(DataTable &table, const std::vector<VSSRowRange> &ranges, IndexSinkState &sink_state,
+	                     std::vector<idx_t> &rows_returned, bool all_committed = false);
+	// todo@gropaul: Should become a virtual of RGPartitionedIndex, implemented by each index
+	// Takes the `count` rows of `chunk` that `sel` selects, all of them if it is unset.
+	SinkResultType Sink(IndexSinkState &sink_state, DataChunk &chunk, const SelectionVector &sel, idx_t count);
+	// todo@gropaul: Becomes a virtual of RGPartitionedIndex, implemented by each index
+	// A sink state for `num_rows` rows of one row group, their ids written to `row_ids`.
+	unique_ptr<IndexSinkState> InitializeIndexSinkState(ClientContext &context, idx_t num_rows, row_t *row_ids);
+	template <bool HAS_SEL>
+	SinkResultType SinkInternal(IndexSinkState &sink_state, DataChunk &chunk, const SelectionVector &sel, idx_t count);
+	// As of the last published commit, or with `all_committed` of every commit, published or not.
+	TransactionData GetCommittedSnapshot(bool all_committed = false) const;
+	// The columns a TableRangeScanner of the indexed rows reads: the indexed column and the row ids.
+	vector<StorageIndex> GetScanColumnIds() const;
+	vector<LogicalType> GetScanTypes() const;
 
 	// The committed rows of [start, end), ascending, written to `row_ids`. Scans only the row id column, so it reads no
 	// column data.
