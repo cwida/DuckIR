@@ -115,4 +115,4 @@ jobs:
             --old build/base/release/benchmark/benchmark_runner \
             --new build/pr/release/benchmark/benchmark_runner \
             --benchmarks ".github/regression/${{ matrix.group }}.csv" \
-            --disable-timeout --verbose --nofail
+            --disable-timeout --verbose
