@@ -111,7 +111,11 @@ struct IndexSinkState {
 	}
 };
 
-// VSSIndex::Sink copies up to `max_rows` non-NULL, finite embeddings, rotated if `rotate`, and their ids if not null.
+// What VSSIndex::Sink does with an embedding with NaN, infinite or too large values.
+enum class NonFiniteEmbeddingAction : uint8_t { SKIP, THROW };
+
+// VSSIndex::Sink writes up to `max_rows` non-NULL embeddings to `embeddings`, rotated if `rotate`, and their ids to
+// `row_ids` if not null. Non-finite ones it skips or throws on, by `non_finite_action`.
 struct VSSIndexSinkState : public IndexSinkState {
 	VSSIndexSinkState(idx_t num_dimensions, float *embeddings, row_t *row_ids, bool rotate,
 	                  PDX::ParallelExecutor *executor, idx_t max_rows = NumericLimits<idx_t>::Maximum());
@@ -121,8 +125,10 @@ struct VSSIndexSinkState : public IndexSinkState {
 	const bool rotate;
 	PDX::ParallelExecutor *const executor;
 	const idx_t max_rows;
-	// A chunk's embeddings before the rotation.
+	NonFiniteEmbeddingAction non_finite_action = NonFiniteEmbeddingAction::SKIP;
+	// A chunk's selected embeddings before the rotation.
 	unique_array<float> raw_embeddings;
+	SelectionVector indexable_sel;
 	// Set by InitializeIndexSinkState, which owns the buffer and the executor of a row group build.
 	BufferHandle embeddings_buffer;
 	unique_ptr<PDX::ParallelExecutor> owned_executor;
@@ -230,8 +236,10 @@ private:
 	// todo@gropaul: Becomes a virtual of RGPartitionedIndex, implemented by each index
 	// A sink state for `num_rows` rows of one row group, their ids written to `row_ids`.
 	unique_ptr<IndexSinkState> InitializeIndexSinkState(ClientContext &context, idx_t num_rows, row_t *row_ids);
+	// Indexes the `indexable_count` rows the state's indexable_sel selects in the flattened `chunk`, or its first ones
+	// without HAS_SEL.
 	template <bool HAS_SEL>
-	SinkResultType SinkInternal(IndexSinkState &sink_state, DataChunk &chunk, const SelectionVector &sel, idx_t count);
+	SinkResultType SinkInternal(VSSIndexSinkState &state, DataChunk &chunk, idx_t indexable_count);
 	// As of the last published commit, or with `all_committed` of every commit, published or not.
 	TransactionData GetCommittedSnapshot(bool all_committed = false) const;
 	// The columns a TableRangeScanner of the indexed rows reads: the indexed column and the row ids.

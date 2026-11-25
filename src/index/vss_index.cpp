@@ -415,59 +415,119 @@ static idx_t GetOptionalIndex(const SelectionVector &sel, const idx_t idx) {
 	return HAS_SEL ? sel.get_index_unsafe(idx) : idx;
 }
 
+// todo@gropaul: the NULL part moves to RGPartitionedIndex
+// Selects the valid, finite rows of `sel` into indexable_sel, up to max_rows. Throws on a non-finite one if asked.
 template <bool HAS_SEL>
-SinkResultType VSSIndex::SinkInternal(IndexSinkState &sink_state, DataChunk &chunk, const SelectionVector &sel,
-                                      const idx_t count) {
-	auto &state = sink_state.Cast<VSSIndexSinkState>();
-	const auto num_dimensions = GetNumDimensions();
-	auto &embedding_column = chunk.data[0];
-	embedding_column.Flatten();
+static idx_t SelectIndexableRows(VSSIndexSinkState &state, Vector &embedding_column, const row_t *scanned_row_ids,
+                                 const idx_t num_dimensions, const SelectionVector &sel, const idx_t count) {
 	const auto &validity = FlatVector::Validity(embedding_column);
+	const bool cannot_have_null = validity.CannotHaveNull();
 	const auto scanned_embeddings = FlatVector::GetData<float>(ArrayVector::GetChild(embedding_column));
-	const auto scanned_row_ids = FlatVector::GetData<row_t>(chunk.data[1]);
-	// Without a rotation, the rows go straight to the output.
-	float *const batch_embeddings =
-	    state.rotate ? state.raw_embeddings.get() : state.embeddings + state.count * num_dimensions;
-	idx_t batch_count = 0;
-	for (idx_t sel_idx = 0; sel_idx < count && state.count + batch_count < state.max_rows; sel_idx++) {
+	idx_t indexable_count = 0;
+	optional_idx first_non_finite;
+	for (idx_t sel_idx = 0; sel_idx < count && state.count + indexable_count < state.max_rows; sel_idx++) {
 		const idx_t i = GetOptionalIndex<HAS_SEL>(sel, sel_idx);
-		// Like NULL embeddings, the ones CREATE INDEX rejects are not indexed.
-		if (!validity.RowIsValid(i) || !IsFiniteEmbedding(scanned_embeddings + i * num_dimensions, num_dimensions)) {
+		if (!cannot_have_null && !validity.RowIsValid(i)) {
 			continue;
 		}
-		memcpy(batch_embeddings + batch_count * num_dimensions, scanned_embeddings + i * num_dimensions,
-		       num_dimensions * sizeof(float));
-		if (state.row_ids) {
-			state.row_ids[state.count + batch_count] = scanned_row_ids[i];
+		if (!IsFiniteEmbedding(scanned_embeddings + i * num_dimensions, num_dimensions)) {
+			if (!first_non_finite.IsValid()) {
+				first_non_finite = i;
+			}
+			continue;
 		}
-		batch_count++;
+		state.indexable_sel.set_index(indexable_count++, i);
 	}
-	if (batch_count == 0) {
-		return SinkResultType::NEED_MORE_INPUT;
+	if (first_non_finite.IsValid()) {
+		switch (state.non_finite_action) {
+		case NonFiniteEmbeddingAction::SKIP:
+			break;
+		case NonFiniteEmbeddingAction::THROW:
+			throw InvalidInputException("DuckIR VSS: the embedding of row %lld has NaN, infinite or too large values, "
+			                            "which cannot be indexed",
+			                            scanned_row_ids[first_non_finite.GetIndex()]);
+		default:
+			throw NotImplementedException("DuckIR VSS: unknown NonFiniteEmbeddingAction");
+		}
+	}
+	return indexable_count;
+}
+
+// The `count` rows `sel` selects, one after the other. Rows to rotate stay in the chunk (the scan copied its array
+// data) if none were dropped, else they are copied into raw_embeddings. Without a rotation they go into the output.
+template <bool HAS_SEL>
+static float *GatherEmbeddings(VSSIndexSinkState &state, float *const scanned_embeddings, const SelectionVector &sel,
+                               const idx_t count, const idx_t num_dimensions, float *const output_embeddings) {
+	if (!HAS_SEL && state.rotate) {
+		return scanned_embeddings;
+	}
+	float *const target = state.rotate ? state.raw_embeddings.get() : output_embeddings;
+	for (idx_t i = 0; i < count; i++) {
+		memcpy(target + i * num_dimensions, scanned_embeddings + GetOptionalIndex<HAS_SEL>(sel, i) * num_dimensions,
+		       num_dimensions * sizeof(float));
+	}
+	return target;
+}
+
+template <bool HAS_SEL>
+static void GatherRowIds(const row_t *row_ids, const SelectionVector &sel, const idx_t count, row_t *const target) {
+	for (idx_t i = 0; i < count; i++) {
+		target[i] = row_ids[GetOptionalIndex<HAS_SEL>(sel, i)];
+	}
+}
+
+template <bool HAS_SEL>
+SinkResultType VSSIndex::SinkInternal(VSSIndexSinkState &state, DataChunk &chunk, const idx_t indexable_count) {
+	auto &embeddings_v = chunk.data[0];
+	D_ASSERT(embeddings_v.GetVectorType() == VectorType::FLAT_VECTOR);
+	const auto num_dimensions = GetNumDimensions();
+	const auto scanned_embeddings = FlatVector::GetDataMutable<float>(ArrayVector::GetChildMutable(embeddings_v));
+	float *const output_embeddings = state.embeddings + state.count * num_dimensions;
+	float *const indexable_embeddings = GatherEmbeddings<HAS_SEL>(state, scanned_embeddings, state.indexable_sel,
+	                                                              indexable_count, num_dimensions, output_embeddings);
+
+	const auto &row_ids_v = chunk.data[1];
+	D_ASSERT(row_ids_v.GetVectorType() == VectorType::FLAT_VECTOR);
+	const auto scanned_row_ids = FlatVector::GetData<row_t>(row_ids_v);
+	if (state.row_ids) {
+		GatherRowIds<HAS_SEL>(scanned_row_ids, state.indexable_sel, indexable_count, state.row_ids + state.count);
 	}
 	if (state.rotate) {
-		vss_wrapper->PreprocessEmbeddings(state.raw_embeddings.get(), state.embeddings + state.count * num_dimensions,
-		                                  batch_count, state.executor);
+		vss_wrapper->PreprocessEmbeddings(indexable_embeddings, output_embeddings, indexable_count, state.executor);
 	} else {
-		vss_wrapper->NormalizeEmbeddings(batch_embeddings, batch_count);
+		vss_wrapper->NormalizeEmbeddings(indexable_embeddings, indexable_count);
 	}
-	state.count += batch_count;
+	state.count += indexable_count;
 	// FINISHED only for the SAQ sample, which sets max_rows.
 	return state.count < state.max_rows ? SinkResultType::NEED_MORE_INPUT : SinkResultType::FINISHED;
 }
 
 SinkResultType VSSIndex::Sink(IndexSinkState &sink_state, DataChunk &chunk, const SelectionVector &sel,
                               const idx_t count) {
-	if (sel.IsSet()) {
-		return SinkInternal<true>(sink_state, chunk, sel, count);
+	D_ASSERT(chunk.ColumnCount() == 2);
+	auto &state = sink_state.Cast<VSSIndexSinkState>();
+	const auto num_dimensions = GetNumDimensions();
+	auto &embedding_column = chunk.data[0];
+	embedding_column.Flatten();
+	const auto scanned_row_ids = FlatVector::GetData<row_t>(chunk.data[1]);
+	const idx_t indexable_count =
+	    sel.IsSet() ? SelectIndexableRows<true>(state, embedding_column, scanned_row_ids, num_dimensions, sel, count)
+	                : SelectIndexableRows<false>(state, embedding_column, scanned_row_ids, num_dimensions, sel, count);
+	if (indexable_count == 0) {
+		return SinkResultType::NEED_MORE_INPUT;
 	}
-	return SinkInternal<false>(sink_state, chunk, sel, count);
+	// Without a scan selection and with every row indexable, the rows are read in place.
+	if (sel.IsSet() || indexable_count < count) {
+		return SinkInternal<true>(state, chunk, indexable_count);
+	}
+	return SinkInternal<false>(state, chunk, indexable_count);
 }
 
 VSSIndexSinkState::VSSIndexSinkState(const idx_t num_dimensions, float *const embeddings, row_t *const row_ids,
                                      const bool rotate, PDX::ParallelExecutor *const executor, const idx_t max_rows)
     : embeddings(embeddings), row_ids(row_ids), rotate(rotate), executor(executor), max_rows(max_rows),
-      raw_embeddings(make_uniq_array_uninitialized<float>(STANDARD_VECTOR_SIZE * num_dimensions)) {
+      raw_embeddings(make_uniq_array_uninitialized<float>(STANDARD_VECTOR_SIZE * num_dimensions)),
+      indexable_sel(STANDARD_VECTOR_SIZE) {
 }
 
 // todo@gropaul: Move to RGPartitionedIndex
